@@ -1,0 +1,16 @@
+import console;
+
+// ================================================================
+//  lib/utils.aardio —— 测试用子模块
+// ================================================================
+
+console.log("    [utils] 子模块已加载!");
+console.log("    [utils] 当前时间: " ++ tostring(time()));
+console.log("    [utils] 工作目录: " ++ io.fullpath("./"));
+
+// 提供一个简单的工具函数演示
+var greet = function(name){
+    console.log("    [utils] Hello, " ++ name ++ "!");
+};
+
+greet("aac user");

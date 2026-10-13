@@ -1,0 +1,5 @@
+// 故意含语法错的工程, 用于验证 aac 的失败路径与退出码
+import console;
+
+console.log("hello"
+var = = ;

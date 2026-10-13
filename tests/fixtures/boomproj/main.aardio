@@ -1,0 +1,3 @@
+import console;
+console.log("pack-boom");
+error("PACK_BOOM");

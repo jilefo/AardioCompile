@@ -1,0 +1,4 @@
+// 验证构建时目录排除: dist/ 与 .build/ 下的 .aardio 不应被打进包
+import console;
+
+console.log("EXCLPROJ:OK");

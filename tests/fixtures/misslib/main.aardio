@@ -1,0 +1,3 @@
+import console;
+import winex.caret;
+console.log("x");

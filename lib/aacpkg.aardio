@@ -1,0 +1,232 @@
+// ================================================================
+//  aacpkg.aardio —— .appkg 包格式编解码（编译器与运行时宿主共享）
+// ================================================================
+//  本文件是「单一源」, 由 build.py 在发布前自动内联到
+//    aac-runner/main.aardio         (编译器)
+//    aardioHost-runner/main.aardio  (运行时宿主)
+//  顶部。因此必须遵守以下约束:
+//
+//    1. 不得出现 import 语句。宿主里的载荷是运行时 loadcode 的,
+//       工程库不一定存在; 本模块只许使用内核函数。
+//    2. 不得直接使用 console / io / fsys 等库, 一律由调用方传入或处理。
+//    3. 模块内禁止定义与调用方同名的全局变量。
+//
+//  包格式 v2:
+//    [宿主原始字节] + MARK + [10位清单长度] + [清单] + [字节码流]
+//
+//  清单: 若干条记录, 单字符 SEP 分隔, 每条 "<字段名>|<值>"
+//    字段名以 '#' 开头的是元信息(不占字节码), 例如
+//      #fmt|2  #kernel|123456  #crc|789  #app|myapp  #ver|1.0.0
+//    其余是文件记录: "<相对路径>|<字节码长度>"
+//
+//  之所以不用 \r\n 或 JSON 做分隔:
+//    - 双引号串里 "\r\n" 只是 4 个字面字符, 不是换行
+//    - string.split(s, sep) 按「字符集」拆分, 传多字符会被逐字符切开
+//    - 竖线在 aardio 模式匹配里是分支符, 因此一律用 string.indexOf 取
+// ================================================================
+
+aacpkg = {};
+
+aacpkg.MARK       = "__AARDIO_PKG__";
+aacpkg.SEP        = "*";     // 单字符; '*' 在 Windows 路径里非法, 不会与真实路径冲突
+aacpkg.LEN_WIDTH  = 10;      // 清单长度定宽字段
+aacpkg.FORMAT_VER = "2";
+
+// string.crc32 返回的是有符号 32 位整数, 会出现负数。
+// 统一转成无符号字符串: 指纹和校验值都要用它, 两处必须一致。
+aacpkg.crc32 = function(s){
+    var c = string.crc32(s);   // 入参是字符串, 不可能为 null: audit:ok
+    if(c < 0){ c = 4294967296 + c; }
+    return tostring(c);   // c 由算术得出, 恒非 null；s 为 null 时 crc32 先抛: audit:ok
+};
+
+// ---- 内核指纹 ----
+// 字节码与 aardio 内核版本绑定, 换版本编译的产物在旧宿主上会 loadcode 失败
+// (报 "bad code")。这里用一段固定源码的字节码校验和作为内核指纹,
+// 写进包里; 宿主比对自身指纹, 不一致时给出明确提示而不是让人猜。
+aacpkg.kernelStamp = function(){
+    var f = loadcode("return 1");
+    if(!f){ return "0"; }
+    var bc = dumpcode(f);
+    if(!bc){ return "0"; }
+    return aacpkg.crc32(bc);
+};
+
+// ---- 子串: 从第 start 个字符起取 n 个（1 基）----
+aacpkg.mid = function(s, start, n){
+    if(start < 1){ start = 1; }
+    var t = string.right(s, #s - (start - 1));
+    return string.left(t, n);
+};
+
+// ---- 打包 ----
+// items: 数组, 每项 { rel = "lib/x.aardio"; code = 字节码 }
+// meta : 表,  允许键 fmt / kernel / crc / app / ver / time
+// 返回: 载荷字符串（调用方决定写到哪）
+aacpkg.pack = function(items, meta){
+    var blobs = "";
+    var manifest = "";
+
+    // 元信息按固定顺序写, 保证同样输入产出同样的字节(可复现构建)
+    var keys = {"fmt"; "kernel"; "app"; "ver"; "time"; "crc"};
+    for(i = 1; #keys; 1){
+        var v = meta[keys[i]];
+        if(v != null){
+            manifest = manifest ++ "#" ++ keys[i] ++ "|" ++ tostring(v) ++ aacpkg.SEP;
+        }
+    }
+
+    for(i = 1; #items; 1){
+        var it = items[i];
+        blobs = blobs ++ it.code;
+        manifest = manifest ++ it.rel ++ "|" ++ #it.code ++ aacpkg.SEP;
+    }
+
+    // crc 放在最后一条元信息里, 需要在 blobs 拼完后重写清单。
+    // 这里采用「二次拼装」: 先算 crc, 再把 crc 元信息插到清单头部。
+    var crcHead = "#crc|" ++ aacpkg.crc32(blobs) ++ aacpkg.SEP;
+    manifest = crcHead ++ manifest;
+
+    return aacpkg.MARK
+        ++ string.format("%0" ++ tostring(aacpkg.LEN_WIDTH) ++ "d", #manifest)
+        ++ manifest
+        ++ blobs;
+};
+
+// ---- 从指定位置解析一个包 ----
+// 成功返回 result, 失败返回 null + 原因。只做纯解析, 不负责找标记。
+aacpkg.parseAt = function(bin, s){
+    var tail = string.right(bin, #bin - (s + #aacpkg.MARK - 1));
+    if(#tail < aacpkg.LEN_WIDTH){
+        return null, "包头不完整（长度不足 " ++ aacpkg.LEN_WIDTH ++ " 字节）";
+    }
+
+    var mLen = tonumber(string.left(tail, aacpkg.LEN_WIDTH));
+    if(!mLen || mLen <= 0 || (mLen + aacpkg.LEN_WIDTH) > #tail){
+        return null, "清单长度无效或数据损坏";
+    }
+
+    var rest     = string.right(tail, #tail - aacpkg.LEN_WIDTH);
+    var manifest = string.left(rest, mLen);
+    var blobs    = string.right(rest, #rest - mLen);
+
+    var result = {};
+    result.files = {};
+    result.meta  = {};
+    result.blobs = blobs;
+
+    var lines = string.split(manifest, aacpkg.SEP);
+    var used  = 0;
+
+    for(i = 1; #lines; 1){
+        var line = lines[i];
+        if(#line){
+            // 竖线在 aardio 模式匹配里是分支符, 只能用纯子串查找
+            var bar = string.indexOf(line, "|");
+            if(bar){
+                var name = string.left(line, bar - 1);
+                var val  = string.right(line, #line - bar);
+                if(#name){
+                    if(string.left(name, 1) == "#"){
+                        result.meta[string.right(name, #name - 1)] = val;
+                    }
+                    else {
+                        var n = tonumber(val);
+                        if(n == null || n < 0){
+                            return null, "清单记录长度非法: " ++ line;
+                        }
+                        if(used + n > #blobs){
+                            return null, "包数据不足（截断）: " ++ name;
+                        }
+                        table.push(result.files, {
+                            rel  = name;
+                            len  = n;
+                            code = aacpkg.mid(blobs, used + 1, n);
+                        });
+                        used = used + n;
+                    }
+                }
+            }
+        }
+    }
+
+    // 严格校验: 清单声明的字节数必须恰好用光 blobs,
+    // 否则说明包被截断或追加了多余数据, 直接判坏而不要静默丢文件。
+    if(used != #blobs){
+        return null, "包数据与清单不符（声明 " ++ tostring(used) ++ " 字节, 实际 " ++ tostring(#blobs) ++ " 字节）";
+    }
+
+    // CRC 校验（旧包没有该字段时跳过）
+    var crc = result.meta["crc"];
+    if(crc){
+        if(aacpkg.crc32(blobs) != crc){
+            return null, "包校验失败（CRC 不匹配, 文件已损坏或被篡改）";
+        }
+    }
+
+    return result, null;
+};
+
+// ---- 解包 ----
+// bin: 完整字节（宿主读自身 EXE, 或 aac exec 读 .appkg）
+// 成功: 返回 { files = { {rel, len, code} ... }; meta = {}; blobs = 字节码流 }
+// 失败: 返回 null, 错误描述
+//
+// 【坑】不能只取「最后一次出现的标记」。
+// aac 自己的源码里就写着 aacpkg.MARK 这个字面量, 编成字节码后
+// __AARDIO_PKG__ 会出现在【载荷内部】, 位置比真正的包头更靠后。
+// lastIndexOf 一律命中那个假标记, 于是按定长清单解析必然失败 ——
+// 表现是 aac 编不了它自己, 报"清单长度无效或数据损坏"。
+// 载荷里带 appkg、或源码里写了这个常量串的工程都会踩到。
+//
+// 对策: 从后往前逐个候选位置试解析, 取第一个「能完整解析」的。
+// 判定足够强, 不会误命中:
+//   1) 清单声明的字节数必须恰好用光剩余数据（内嵌包不会延伸到文件尾）
+//   2) CRC 必须匹配
+aacpkg.parse = function(bin){
+    if(!bin || #bin == 0){
+        return null, "数据为空";
+    }
+
+    var poss = {};
+    var p = 1;
+    while(true){
+        var q = string.indexOf(bin, aacpkg.MARK, p);
+        if(!q){ break; }
+        table.push(poss, q);
+        p = q + 1;
+        if(p > #bin){ break; }
+    }
+    if(#poss == 0){
+        return null, "未找到包标记 " ++ aacpkg.MARK;
+    }
+
+    var lastErr = "包标记后不是合法清单（数据损坏或不是 aac 产物）";
+    var t = #poss;
+    while(t >= 1){
+        var rr = null;
+        var ee = null;
+        rr, ee = aacpkg.parseAt(bin, poss[t]);
+        if(rr){ return rr, null; }
+        if(ee){ lastErr = ee; }
+        t = t - 1;
+    }
+    return null, lastErr;
+};
+
+// ---- 目录排除判定 ----
+// rel: 相对路径如 "lib/x.aardio"; excl: 目录名数组
+// 任意一层目录命中即排除（旧实现只判断直接父目录, 深层文件会被误打包）
+aacpkg.isExcluded = function(rel, excl){
+    if(!excl || #excl == 0){ return false; }
+    var parts = string.split(rel, "/");
+    var last = #parts - 1;             // 最后一段是文件名
+    var pi = 0;
+    var pj = 0;
+    for(pi = 1; last; 1){
+        for(pj = 1; #excl; 1){
+            if(parts[pi] == excl[pj]){ return true; }
+        }
+    }
+    return false;
+};

@@ -1,0 +1,23 @@
+// 退出码测试工程: 用 --exit=N 让 main 返回指定数字,
+// 验证 run / exec / 独立 EXE 三条链路都能把返回值变成进程退出码。
+import console;
+
+var argv = _ARGV;
+if(APP_ARGS != null){ argv = APP_ARGS; }
+
+var code = 0;
+for(i = 1; #argv; 1){
+    if(string.startWith(argv[i], "--exit=")){
+        // "--exit=" 长 7 个字符, 冒号后才是数字
+        var n = tonumber(string.right(argv[i], #argv[i] - 7));
+        if(n != null){ code = n; }
+    }
+}
+
+console.log("EXIT_MAIN code=" ++ tostring(code));
+console.log("ARGS=" ++ #argv);
+for(i = 1; #argv; 1){
+    console.log("  #" ++ i ++ " = " ++ argv[i]);
+}
+
+return code;

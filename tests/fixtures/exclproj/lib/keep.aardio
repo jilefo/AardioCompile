@@ -1,0 +1,3 @@
+// lib/ 下的文件必须被打进包
+import console;
+console.log("lib/keep.aardio loaded");

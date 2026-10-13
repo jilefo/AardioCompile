@@ -1,0 +1,34 @@
+# ============================================================
+# 行尾与二进制声明
+#
+# 【为什么要显式声明】这个工程自己就在跟行尾打交道：
+#   - 宿主源码 aardioHost.aardio 全程 CRLF（559 行，一个都不能变 LF，
+#     否则每次 host-del 都会多出一行噪音 diff）；
+#   - 测试里有专门按字节校验行尾的用例（read_fake_host_bytes）。
+# 只靠 core.autocrlf 的默认值，不同贡献者检出的行尾会不一致，
+# 于是"他那儿通过、我这儿报错"。这里把规则写死在仓库里，谁都一样。
+# ============================================================
+
+* text=auto
+
+# aardio 源码：aardio 工具链一律写 CRLF，保持一致最省事
+*.aardio text eol=crlf
+
+# 工程与清单文件
+*.aproj text eol=crlf
+
+# 必须当作文本的脚本
+*.py  text eol=lf
+*.cmd text eol=crlf
+*.md  text eol=lf
+*.txt text eol=crlf
+
+# 二进制：绝不能被换行转换或当作文本 diff
+*.exe   binary
+*.dll   binary
+*.appkg binary
+*.mp4   binary
+*.png   binary
+*.gif   binary
+*.ico   binary
+*.zip   binary

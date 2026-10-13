@@ -1,0 +1,3 @@
+import console;
+import string.res;
+console.log("ADDED_LIB_OK");

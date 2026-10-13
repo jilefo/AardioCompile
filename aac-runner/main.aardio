@@ -1,0 +1,3086 @@
+// ===== BEGIN AUTO-INLINE: lib/aacpkg.aardio =====
+// ================================================================
+//  aacpkg.aardio —— .appkg 包格式编解码（编译器与运行时宿主共享）
+// ================================================================
+//  本文件是「单一源」, 由 build.py 在发布前自动内联到
+//    aac-runner/main.aardio         (编译器)
+//    aardioHost-runner/main.aardio  (运行时宿主)
+//  顶部。因此必须遵守以下约束:
+//
+//    1. 不得出现 import 语句。宿主里的载荷是运行时 loadcode 的,
+//       工程库不一定存在; 本模块只许使用内核函数。
+//    2. 不得直接使用 console / io / fsys 等库, 一律由调用方传入或处理。
+//    3. 模块内禁止定义与调用方同名的全局变量。
+//
+//  包格式 v2:
+//    [宿主原始字节] + MARK + [10位清单长度] + [清单] + [字节码流]
+//
+//  清单: 若干条记录, 单字符 SEP 分隔, 每条 "<字段名>|<值>"
+//    字段名以 '#' 开头的是元信息(不占字节码), 例如
+//      #fmt|2  #kernel|123456  #crc|789  #app|myapp  #ver|1.0.0
+//    其余是文件记录: "<相对路径>|<字节码长度>"
+//
+//  之所以不用 \r\n 或 JSON 做分隔:
+//    - 双引号串里 "\r\n" 只是 4 个字面字符, 不是换行
+//    - string.split(s, sep) 按「字符集」拆分, 传多字符会被逐字符切开
+//    - 竖线在 aardio 模式匹配里是分支符, 因此一律用 string.indexOf 取
+// ================================================================
+
+aacpkg = {};
+
+aacpkg.MARK       = "__AARDIO_PKG__";
+aacpkg.SEP        = "*";     // 单字符; '*' 在 Windows 路径里非法, 不会与真实路径冲突
+aacpkg.LEN_WIDTH  = 10;      // 清单长度定宽字段
+aacpkg.FORMAT_VER = "2";
+
+// string.crc32 返回的是有符号 32 位整数, 会出现负数。
+// 统一转成无符号字符串: 指纹和校验值都要用它, 两处必须一致。
+aacpkg.crc32 = function(s){
+    var c = string.crc32(s);   // 入参是字符串, 不可能为 null: audit:ok
+    if(c < 0){ c = 4294967296 + c; }
+    return tostring(c);   // c 由算术得出, 恒非 null；s 为 null 时 crc32 先抛: audit:ok
+};
+
+// ---- 内核指纹 ----
+// 字节码与 aardio 内核版本绑定, 换版本编译的产物在旧宿主上会 loadcode 失败
+// (报 "bad code")。这里用一段固定源码的字节码校验和作为内核指纹,
+// 写进包里; 宿主比对自身指纹, 不一致时给出明确提示而不是让人猜。
+aacpkg.kernelStamp = function(){
+    var f = loadcode("return 1");
+    if(!f){ return "0"; }
+    var bc = dumpcode(f);
+    if(!bc){ return "0"; }
+    return aacpkg.crc32(bc);
+};
+
+// ---- 子串: 从第 start 个字符起取 n 个（1 基）----
+aacpkg.mid = function(s, start, n){
+    if(start < 1){ start = 1; }
+    var t = string.right(s, #s - (start - 1));
+    return string.left(t, n);
+};
+
+// ---- 打包 ----
+// items: 数组, 每项 { rel = "lib/x.aardio"; code = 字节码 }
+// meta : 表,  允许键 fmt / kernel / crc / app / ver / time
+// 返回: 载荷字符串（调用方决定写到哪）
+aacpkg.pack = function(items, meta){
+    var blobs = "";
+    var manifest = "";
+
+    // 元信息按固定顺序写, 保证同样输入产出同样的字节(可复现构建)
+    var keys = {"fmt"; "kernel"; "app"; "ver"; "time"; "crc"};
+    for(i = 1; #keys; 1){
+        var v = meta[keys[i]];
+        if(v != null){
+            manifest = manifest ++ "#" ++ keys[i] ++ "|" ++ tostring(v) ++ aacpkg.SEP;
+        }
+    }
+
+    for(i = 1; #items; 1){
+        var it = items[i];
+        blobs = blobs ++ it.code;
+        manifest = manifest ++ it.rel ++ "|" ++ #it.code ++ aacpkg.SEP;
+    }
+
+    // crc 放在最后一条元信息里, 需要在 blobs 拼完后重写清单。
+    // 这里采用「二次拼装」: 先算 crc, 再把 crc 元信息插到清单头部。
+    var crcHead = "#crc|" ++ aacpkg.crc32(blobs) ++ aacpkg.SEP;
+    manifest = crcHead ++ manifest;
+
+    return aacpkg.MARK
+        ++ string.format("%0" ++ tostring(aacpkg.LEN_WIDTH) ++ "d", #manifest)
+        ++ manifest
+        ++ blobs;
+};
+
+// ---- 从指定位置解析一个包 ----
+// 成功返回 result, 失败返回 null + 原因。只做纯解析, 不负责找标记。
+aacpkg.parseAt = function(bin, s){
+    var tail = string.right(bin, #bin - (s + #aacpkg.MARK - 1));
+    if(#tail < aacpkg.LEN_WIDTH){
+        return null, "包头不完整（长度不足 " ++ aacpkg.LEN_WIDTH ++ " 字节）";
+    }
+
+    var mLen = tonumber(string.left(tail, aacpkg.LEN_WIDTH));
+    if(!mLen || mLen <= 0 || (mLen + aacpkg.LEN_WIDTH) > #tail){
+        return null, "清单长度无效或数据损坏";
+    }
+
+    var rest     = string.right(tail, #tail - aacpkg.LEN_WIDTH);
+    var manifest = string.left(rest, mLen);
+    var blobs    = string.right(rest, #rest - mLen);
+
+    var result = {};
+    result.files = {};
+    result.meta  = {};
+    result.blobs = blobs;
+
+    var lines = string.split(manifest, aacpkg.SEP);
+    var used  = 0;
+
+    for(i = 1; #lines; 1){
+        var line = lines[i];
+        if(#line){
+            // 竖线在 aardio 模式匹配里是分支符, 只能用纯子串查找
+            var bar = string.indexOf(line, "|");
+            if(bar){
+                var name = string.left(line, bar - 1);
+                var val  = string.right(line, #line - bar);
+                if(#name){
+                    if(string.left(name, 1) == "#"){
+                        result.meta[string.right(name, #name - 1)] = val;
+                    }
+                    else {
+                        var n = tonumber(val);
+                        if(n == null || n < 0){
+                            return null, "清单记录长度非法: " ++ line;
+                        }
+                        if(used + n > #blobs){
+                            return null, "包数据不足（截断）: " ++ name;
+                        }
+                        table.push(result.files, {
+                            rel  = name;
+                            len  = n;
+                            code = aacpkg.mid(blobs, used + 1, n);
+                        });
+                        used = used + n;
+                    }
+                }
+            }
+        }
+    }
+
+    // 严格校验: 清单声明的字节数必须恰好用光 blobs,
+    // 否则说明包被截断或追加了多余数据, 直接判坏而不要静默丢文件。
+    if(used != #blobs){
+        return null, "包数据与清单不符（声明 " ++ tostring(used) ++ " 字节, 实际 " ++ tostring(#blobs) ++ " 字节）";
+    }
+
+    // CRC 校验（旧包没有该字段时跳过）
+    var crc = result.meta["crc"];
+    if(crc){
+        if(aacpkg.crc32(blobs) != crc){
+            return null, "包校验失败（CRC 不匹配, 文件已损坏或被篡改）";
+        }
+    }
+
+    return result, null;
+};
+
+// ---- 解包 ----
+// bin: 完整字节（宿主读自身 EXE, 或 aac exec 读 .appkg）
+// 成功: 返回 { files = { {rel, len, code} ... }; meta = {}; blobs = 字节码流 }
+// 失败: 返回 null, 错误描述
+//
+// 【坑】不能只取「最后一次出现的标记」。
+// aac 自己的源码里就写着 aacpkg.MARK 这个字面量, 编成字节码后
+// __AARDIO_PKG__ 会出现在【载荷内部】, 位置比真正的包头更靠后。
+// lastIndexOf 一律命中那个假标记, 于是按定长清单解析必然失败 ——
+// 表现是 aac 编不了它自己, 报"清单长度无效或数据损坏"。
+// 载荷里带 appkg、或源码里写了这个常量串的工程都会踩到。
+//
+// 对策: 从后往前逐个候选位置试解析, 取第一个「能完整解析」的。
+// 判定足够强, 不会误命中:
+//   1) 清单声明的字节数必须恰好用光剩余数据（内嵌包不会延伸到文件尾）
+//   2) CRC 必须匹配
+aacpkg.parse = function(bin){
+    if(!bin || #bin == 0){
+        return null, "数据为空";
+    }
+
+    var poss = {};
+    var p = 1;
+    while(true){
+        var q = string.indexOf(bin, aacpkg.MARK, p);
+        if(!q){ break; }
+        table.push(poss, q);
+        p = q + 1;
+        if(p > #bin){ break; }
+    }
+    if(#poss == 0){
+        return null, "未找到包标记 " ++ aacpkg.MARK;
+    }
+
+    var lastErr = "包标记后不是合法清单（数据损坏或不是 aac 产物）";
+    var t = #poss;
+    while(t >= 1){
+        var rr = null;
+        var ee = null;
+        rr, ee = aacpkg.parseAt(bin, poss[t]);
+        if(rr){ return rr, null; }
+        if(ee){ lastErr = ee; }
+        t = t - 1;
+    }
+    return null, lastErr;
+};
+
+// ---- 目录排除判定 ----
+// rel: 相对路径如 "lib/x.aardio"; excl: 目录名数组
+// 任意一层目录命中即排除（旧实现只判断直接父目录, 深层文件会被误打包）
+aacpkg.isExcluded = function(rel, excl){
+    if(!excl || #excl == 0){ return false; }
+    var parts = string.split(rel, "/");
+    var last = #parts - 1;             // 最后一段是文件名
+    var pi = 0;
+    var pj = 0;
+    for(pi = 1; last; 1){
+        for(pj = 1; #excl; 1){
+            if(parts[pi] == excl[pj]){ return true; }
+        }
+    }
+    return false;
+};
+// ===== END AUTO-INLINE =====
+// ================================================================
+//  aac.aardio —— aardio 命令行编译器（dumpcode 模式，不依赖 IDE）
+// ================================================================
+//  用法:
+//    aac build   <工程目录|.aproj> [--out=目录|文件.exe] [--name=应用名]
+//                [--ver=版本号] [--host=aardioHost.exe] [--no-exe]
+//                [--exclude=目录名,目录名] [--no-lib-check] [--no-pause] [--quiet] [--log=文件]
+//    aac compile <源文件.aardio> <输出.dump>  [--no-pause] [--quiet]
+//    aac run     <脚本.aardio|.dump> [脚本参数...]  [--no-pause]
+//    aac exec    <包文件.appkg> [脚本参数...]  [--no-pause]
+//    aac info    <包文件.appkg|.exe>           [--no-pause]
+//    aac libs                                  [--no-pause]
+//    aac host-add lib1,lib2                    [--rebuild] [--cwd=目录] [--no-pause]
+//    aac version
+//    aac help
+//
+//  全局选项: --cwd=目录  指定相对路径的基准目录
+//            aardio 独立 EXE 会把当前目录劫持到 EXE 目录,
+//            不指定 --cwd 时相对路径会按 EXE 目录解析。
+//
+//  参数分隔: "--" 之后的内容不再按 aac 选项解释, 原样透传给脚本
+//            aac exec pkg --no-pause -- --log=x 123
+//
+//  退出码: 0 成功 / 1 失败 / n 被调脚本 main 返回的数字（run/exec/独立EXE）
+//  输出前缀: [OK] 成功 / [ERR] 失败 / [INFO] 过程 / [WARN] 警告
+//
+//  给 CI / AI 调用的两个硬性要求:
+//    1. 必须带 --no-pause 或 --log=文件。默认结尾会 console.pause(),
+//       无 stdin 时永久挂起, 表现为"卡死、零输出"。
+//    2. console.log 走 WriteConsoleB 直写控制台句柄, 管道/重定向抓不到
+//       任何内容, 排错必须靠 --log 落盘。
+// ================================================================
+
+import console;
+import fsys;
+import dotNet;
+
+// 2.3.0: host-add / host-del 改为幂等（判定依据换成源码 import 区块、写入前去
+//        重、哨兵整体重写），且"全部已预埋 / 删本来就没有"由 rc=1 改为 rc=0。
+//        行为变了就必须升版本 —— 否则别人以为同一个版本号是同一套语义。
+// 2.3.1: 修掉 2.3.0 留下的半截 —— host-add 的"已预埋"判定里仍掺着 EXE 哨兵，
+//        于是 host-del X 之后（未 --rebuild）再 host-add X 会被静默跳过：
+//        说了"已预埋"却没写进源码 → 下次发布必缺 → 再补库还是这句 → 死循环。
+//        现在哨兵只用来给出"两边没同步"的诊断，不再参与任何判定。
+// 2.4.0: cmd.exe 下不再强制写 --cwd —— 新增 recoverCallerCwd()，从 cmd 继承下来的
+//        "<盘符>:=<该盘当前目录>" 里把调用方的真实位置捞回来。此前这条只能靠
+//        aac.cmd 包装器注入 %CD%，而 PATH 里 .EXE 的优先级高于 .CMD，
+//        照文档装完再敲 `aac` 走的还是裸 EXE —— 对新用户等于这项修正从未生效。
+//        出现多个盘符变量时不许猜（谁也不知道用户站在哪个盘），退回原报错。
+var AAC_VERSION = "2.4.0";
+
+// build.py 会把 lib/aacpkg.aardio 内联到本文件顶部。
+// 单独 compile 本文件时缺少该库, 给出明确提示而不是运行到一半崩掉。
+if(aacpkg == null){
+    error("缺少内联库 aacpkg（请用 build.py 发布的版本）");
+}
+
+// ============================================================
+//  全局状态
+// ============================================================
+
+var noPauseFlag = false;
+var quietFlag   = false;
+var logPath     = null;
+
+// 调用方显式指定的「当前目录基准」。
+// 见下方「工作目录基准」一节 —— aardio 独立 EXE 会把 CWD 劫持到 EXE 目录,
+// 这里提前声明是为了避免前向引用（用到它的工具函数定义在文件更前面）。
+var cwdBase = null;
+
+// 【已实测】string.save 对纯字符串是「字节直通」:
+//   写入的就是字符串当前持有的字节, 第 4 个代码页参数不会做任何转换
+//   (实验中传 936/GBK 写出来的仍然是 UTF-8 字节, 三个字节一字不差)。
+//   所以这里的 65001 只是把意图写清楚 + 防未来内核真的实现转换时改语义。
+// 顺带澄清一个长期误导: 中文看着乱码是【控制台】的事 ——
+//   console.log 走 WriteConsoleB, 控制台代码页是 936 时 UTF-8 字节才变乱码;
+//   落盘文件一直是 UTF-8, Python/文本工具按 utf-8 读就正常(不带 BOM)。
+//   终端里想看对, 执行 chcp 65001。
+var CP_UTF8 = 65001;
+
+// 坑: tostring(null) 会抛 "Bad argument @1 Expected value",
+// 而 io.exist 对不存在的路径返回 null。所有对外输出必须先过这里。
+var S = function(v){
+    if(v == null){ return ""; }
+    return tostring(v);
+};
+
+var emit = function(s){
+    console.log(S(s));
+};
+
+var info = function(msg){
+    if(quietFlag){ return; }
+    emit("[INFO] " ++ S(msg));
+};
+var ok = function(msg){
+    emit("[OK] " ++ S(msg));
+};
+var err = function(msg){
+    emit("[ERR] " ++ S(msg));
+};
+var warn = function(msg){
+    emit("[WARN] " ++ S(msg));
+};
+
+// 判断 stdin 是不是一个真正的交互式控制台。
+// CI 里通常是 `aac ... | tee log` 或 stdin 被接到管道,
+// 此时 console.pause() 等不到任何输入 —— 进程永久挂起,
+// 外部只能靠超时把整个构建干掉。这里主动识别并跳过暂停。
+// 【坑】aardio 里 try{} / catch{} 块中的 `return 值` 既不返回也不生效:
+// 实测 try{ return 5; } 后面还有 return 9 时结果是 9；后面没有语句时结果是 null。
+// 所以异常分支必须「先落到变量，再在 try 之外 return」。
+var stdinIsConsole = function(){
+    var interactive = false;
+    try{
+        var h = ::Kernel32.GetStdHandle(-10 /*STD_INPUT_HANDLE*/);
+        if(h){
+            var modeBuf = raw.buffer(4);
+            var r = ::Kernel32.GetConsoleMode(h, modeBuf);
+            if(r == 0 || r == false){ interactive = false; }
+            else { interactive = true; }
+        }
+    }
+    catch(e){
+        // 探测失败一律按「非交互」处理, 宁可不暂停也不能挂死
+        interactive = false;
+    }
+    return interactive;
+};
+
+// 三重防护, 任意一条命中都不暂停:
+//   1. 显式 --no-pause
+//   2. 指定了 --log（CI 友好设计, 见 dispatch）
+//   3. stdin 不是交互控制台（重定向/管道）
+var pauseIfNeed = function(){
+    if(noPauseFlag){ return; }
+    if(!stdinIsConsole()){ return; }
+    console.pause();
+};
+
+// 进程退出码: aardio 脚本的 return 值不会成为进程退出码,
+// 必须显式调 Environment.Exit。注意 dotNet.import 的参数是「程序集名」,
+// 写 "System.Environment" 会报"加载程序集失败"。
+var hardExit = function(code){
+    try{
+        var sys = dotNet.import("System");
+        sys.Environment.Exit(code);
+    }
+    catch(e){
+        warn("无法设置退出码: " ++ S(e));
+    }
+    return code;
+};
+
+var exitErr = function(msg){
+    err(msg);
+    pauseIfNeed();
+    hardExit(1);
+    return 1;
+};
+
+// ============================================================
+//  路径与字符串工具
+// ============================================================
+
+var CH_BACKSLASH = string.char(92) ++ string.char(92);  // 模式里表示字面反斜杠要写两个
+var CH_QUOTE     = string.char(34);
+var CH_APOS      = string.char(39);
+
+// 【血的教训】双引号串里 "\n" "\r" "\t" 都不是转义, 就是字面字符:
+//   "\r\n" = 4 个字符(\ r \ n), 不是换行; "\t" = 两个字符(\ t), 不是制表符。
+// 后果远比"显示不对"严重:
+//   - string.trim(s, " \t\r\n") 的字符集是 {空格, \, t, r, n},
+//     于是 winex.caret 被啃成 winex.care、ncolor 被啃成 colo;
+//   - 找换行写成 indexOf(src, "\n") 永远找不到, 整份源码被当成一行,
+//     两条 import 中间一旦夹了注释, 后面的库就全漏检 —— 构建报"依赖检查通过",
+//     产物一运行就 import failed。这正是"缺库一直出错"的根因。
+// 所以凡是涉及空白的地方, 一律用下面这些真实字符常量。
+var CH_TAB = string.char(9);
+var CH_CR  = string.char(13);
+var CH_LF  = string.char(10);
+var CH_BS  = string.char(92);   // 单个反斜杠
+var CRLF   = CH_CR ++ CH_LF;
+var WS     = " " ++ CH_TAB ++ CH_CR ++ CH_LF;  // 真·空白字符集
+// 同理, 源码里写 "\\" 得到的是【两个】反斜杠, 拿它和单个字符做 == 比较
+// 永远不成立 —— 那种分支是死代码, 表现为"Windows 路径末尾带 \ 的情况没处理"。
+// 需要单反斜杠一律用 CH_BS。
+
+var normPath = function(p){
+    p = S(p);
+    // 统一为正斜杠, aardio 完全兼容
+    p = string.replace(p, CH_BACKSLASH, "/");
+    // 去掉末尾斜杠（保留盘符根 "D:/" 这种长度 3 的情形）
+    while(#p > 3 && string.right(p, 1) == "/"){
+        p = string.left(p, #p - 1);
+    }
+    return p;
+};
+
+var fileExists = function(path){
+    // io.exist 返回「找到的路径字符串」, 不存在返回 null
+    return io.exist(path) != null;
+};
+
+// 源码字面量转义: 注入到双引号串前必须处理, 反斜杠会被当转义符
+// (\t \d \s 等), 双引号会提前闭合字符串, 两者都会让 main.aardio 语法崩掉。
+var escStr = function(s){
+    s = S(s);
+    s = string.replace(s, CH_BACKSLASH, "/");
+    s = string.replace(s, CH_QUOTE, CH_APOS);
+    return s;
+};
+
+var parentDir = function(p){
+    var d = string.match(normPath(p), `^(.*)/[^/]+$`);
+    if(d){ return d; }
+    return null;
+};
+
+var baseName = function(p){
+    var b = string.match(normPath(p), `([^/]+)$`);
+    if(b){ return b; }
+    return "";
+};
+
+var stripExt = function(name){
+    if(string.endWith(name, ".exe", true)){
+        return string.left(name, #name - 4);
+    }
+    if(string.endWith(name, ".appkg", true)){
+        return string.left(name, #name - 6);
+    }
+    return name;
+};
+
+var ensureDir = function(d){
+    if(!d){ return; }
+    if(!fileExists(d)){
+        fsys.createDir(d);
+    }
+};
+
+// 按 rel 升序排序, 保证每次构建的清单顺序一致（可复现构建）
+var sortByRel = function(arr){
+    var a1 = 0;
+    var b1 = 0;
+    for(a1 = 1; #arr - 1; 1){
+        for(b1 = a1 + 1; #arr; 1){
+            if(arr[b1].rel < arr[a1].rel){
+                var tmp = arr[a1];
+                arr[a1] = arr[b1];
+                arr[b1] = tmp;
+            }
+        }
+    }
+};
+
+// dumpcode 只接受「函数对象」, 直接传源码字符串会抛
+//   "unable to dump given function"
+var compileSource = function(src){
+    var f, lerr = loadcode(src);
+    if(!f){
+        return null, (lerr ? S(lerr) : "loadcode 返回空函数");
+    }
+    var bc, derr = dumpcode(f);
+    if(!bc){
+        return null, (derr ? S(derr) : "dumpcode 返回空字节码");
+    }
+    return bc, null;
+};
+
+// ---- 编译时文件包含 $"/xxx" 的路径基准修正 ----
+// 【真实语料踩出来的坑】126 个开源工程里有 16 个编不过，全部死在
+//     Cannot include file:/res/index.aardio
+// 原因: aardio 的 `$"..."` 是**编译期**把文件内容读进来当字符串，
+// 里面的路径以斜杠/反斜杠开头时，IDE 按「当前工程目录」解析；
+// 而 aac 是个独立 EXE，aadio 内核把这种前导斜杠解析成**应用基准目录**
+// （实测 io.fullpath("/res/x") -> %AARDIO_HOME%\res\x，即 aac 自己所在目录）。
+// 于是这些工程在 IDE 里能发布、用 aac 一律编不过。
+//
+// 修法: 只在内存里把 `$"/..."` / `$"\..."` 前面补上工程目录，
+// 语义与 IDE 完全一致，磁盘源码一个字节都不动。
+var fixIncludeRoots = function(src, base){
+    if(!src || !base){ return src; }
+    var Q = string.char(34);
+    var mark = "$" ++ Q;
+    var out = "";
+    var pos = 1;
+    var fixed = 0;
+    while(true){
+        var k = string.indexOf(src, mark, pos);
+        if(!k){
+            out = out ++ string.right(src, #src - (pos - 1));
+            break;
+        }
+        out = out ++ aacpkg.mid(src, pos, k - pos) ++ mark;
+        var p = k + 2;                       // 指向字面量第一个字符
+        if(p > #src){ break; }               // 文件正好以 $" 结尾
+        var c0 = aacpkg.mid(src, p, 1);
+        if(c0 == "/" or c0 == CH_BS){
+            out = out ++ base ++ c0;
+            fixed = fixed + 1;
+            pos = p + 1;
+        }
+        elseif(c0 == "~" and (p + 1) <= #src){
+            // 语料里还见到 `$\"~\\res\\x.ttf\"`: ~ 同样代表应用根目录,
+            // 实测 io.fullpath(\"~/res/x\") -> %AARDIO_HOME%\\res\\x。
+            // 一起按工程目录顶掉。
+            var c1 = aacpkg.mid(src, p + 1, 1);
+            if(c1 == "/" or c1 == CH_BS){
+                out = out ++ base ++ c1;
+                fixed = fixed + 1;
+                pos = p + 2;
+            }
+            else {
+                out = out ++ c0;
+                pos = p + 1;
+            }
+        }
+        else {
+            out = out ++ c0;
+            pos = p + 1;
+        }
+    }
+    return out, fixed;
+};
+
+// 剥离 main.aardio 里可能残留的旧构建信息块。
+// 只在文件开头按注释块定位, 绝不用 string.find 全文搜标记名 ——
+// 源码注释里只要出现同样的字样就会被命中, 把整段正文切掉。
+//
+// 注意: aardio 的顶层 var 函数必须「先定义后使用」。
+// 定义在调用它的 cmdBuild 之后时, 编译期会把它绑成 self 成员,
+// 运行时取到 null（Attempt to call self(namespace) 'xxx' null）。
+var stripBuildInfo = function(src){
+    if(!string.startWith(src, "/*")){ return src; }
+    var p = string.indexOf(src, "*/");
+    if(!p || p > 400){ return src; }
+    var head = string.left(src, p + 1);
+    if(!string.indexOf(head, "BUILD_INFO_BEGIN")){ return src; }
+    var q = string.indexOf(src, "BUILD_INFO_END");
+    if(!q){ return src; }
+    var tailPart = string.right(src, #src - (q - 1));
+    var r = string.indexOf(tailPart, "*/");
+    if(!r){ return src; }
+    return string.right(tailPart, #tailPart - (r + 1));
+};
+
+// 把脚本返回值规整成进程退出码。
+// Windows 退出码只有低 8 位有效: return -1 实际会变成 255, 排查时极费解,
+// 所以超范围时先告警再收敛, 而不是让调用方看到一个莫名其妙的数字。
+//
+// 约定:
+//   数字   0~255 原样, 超出取模并告警
+//   true   0 / false  1（脚本用 return ok 就能表达成败）
+//   其他   0
+var toExitCode = function(ret){
+    if(ret == null){ return 0; }
+    var tCtx = type(ret);
+    if(tCtx == "boolean"){
+        return ret ? 0 : 1;
+    }
+    if(tCtx != "number"){ return 0; }
+    var n = ret;
+    if(n < 0 || n > 255){
+        var m = n % 256;
+        warn("脚本返回值 " ++ tostring(ret) ++ " 超出 0~255，已收敛为 " ++ tostring(m));  // m 由算术得出, 恒非null: audit:ok
+        n = m;
+    }
+    return n;
+};
+
+var scanImports = function(src){
+    var found = {};
+    var pos = 1;
+    while(true){
+        var nl = string.indexOf(src, CH_LF, pos);
+        var line = null;
+        if(nl){
+            line = aacpkg.mid(src, pos, nl - pos);
+            pos = nl + 1;
+        }
+        else {
+            line = string.right(src, #src - (pos - 1));
+            pos = #src + 1;
+        }
+        line = string.trim(line);
+        while(string.startWith(line, "import ")){
+            var body = string.right(line, #line - 7);
+            var sc = string.indexOf(body, ";");
+            if(!sc){ break; }
+            var nm = string.trim(string.left(body, sc - 1));
+            if(#nm){
+                // 去重。循环变量必须局部声明:
+                // 本函数在 cmdBuild 的源文件循环里被调用, 用全局 i 会把外层迭代搅乱
+                var dup = false;
+                var d = 0;
+                for(d = 1; #found; 1){
+                    if(found[d] == nm){ dup = true; break; }
+                }
+                if(!dup){ table.push(found, nm); }
+            }
+            line = string.trim(string.right(body, #body - sc));
+        }
+        if(pos > #src){ break; }
+    }
+    return found;
+};
+
+// 从宿主二进制里提取它预埋的能力清单。
+// 宿主源码里有一行形如
+//     HOST_LIBS_DECL = "/*__HOST_LIBS__*/console,fsys,.../*__HOST_LIBS_END__*/";
+// 的常量, IDE 发布后该字符串必然存在于 EXE 字节里, 据此即可知道宿主支持哪些库。
+// 取不到（例如用了第三方宿主）时返回 null, 由调用方降级为跳过检查。
+var extractHostLibs = function(hostBin){
+    if(!hostBin){ return null; }
+    var s = string.indexOf(hostBin, "__HOST_LIBS__*/");
+    if(!s){ return null; }
+    var e = string.indexOf(hostBin, "/*__HOST_LIBS_END__");
+    if(!e || e <= s){ return null; }
+    var begin = s + 15;
+    if(e < begin){ return null; }
+    var inner = aacpkg.mid(hostBin, begin, e - begin);
+    if(!#inner){ return null; }
+    return string.split(inner, ",");
+};
+
+var isOneOf = function(list, a){
+    var m = 0;
+    for(m = 1; #list; 1){
+        if(a == list[m]){ return true; }
+    }
+    return false;
+};
+
+// ============================================================
+//  缺库诊断 / 智能建议 / 自动补库
+// ============================================================
+// 绝大多数「找不到库」并不是真的没有这个库, 而是叫法不同:
+//   想要 uuid -> 实际上叫 string.uuid
+//   想要 zip  -> 实际上是 zlib.zip / zlib.unzip
+// 与其让用户去翻 aardio 文档, 不如直接列出本机真实存在的候选。
+//
+// 【顺序是硬性要求】aardio 的顶层 var 函数必须「先定义后使用」。
+// 定义在调用者之后时, 编译期会把它绑成 self 成员, 运行时取到 null:
+//   Attempt to call / self(namespace) / Name:'xxx' / Type:null
+// 已用探针实测确认。下面的工具函数因此全部集中放在使用者之前。
+
+// 常见「直觉库名 -> aardio 真实库名」对照表。
+// 命中后还会逐个验证是否真的存在于本机, 不存在就不推荐, 避免二次误导。
+var LIB_ALIAS = {
+    {"uuid";      "string.uuid,win.guid,com.guid"};
+    {"guid";      "string.uuid,win.guid,com.guid"};
+    {"zip";       "zlib.zip,zlib.unzip"};
+    {"unzip";     "zlib.unzip"};
+    {"gzip";      "zlib"};
+    {"lzma";      "sevenZip.lzma"};
+    {"tar";       "fsys.tar,fsys.untar"};
+    {"config";    "fsys.config,sys.config"};
+    {"setting";   "fsys.config"};
+    {"ini";       "fsys.ini,string.ini"};
+    {"json";      "json,web.json"};
+    {"msgbox";    "win.msgbox,win.dlg.message"};
+    {"dialog";    "win.dlg,fsys.dlg"};
+    {"http";      "inet.http,inet.whttp"};
+    {"socket";    "wsock"};
+    {"regex";     "string.regex"};
+    {"xml";       "string.xml,web.msxml"};
+    {"html";      "string.html,web.mshtml"};
+    {"sqlite";    "sqlite"};
+    {"excel";     "com.excel,access"};
+    {"wmi";       "com.wmi"};
+    {"timer";     "win.timer,time.timer,thread.timer"};
+    {"hotkey";    "key.hotkey"};
+    {"clipboard"; "win.clip"};
+    {"mysql";     "access,access.oleDb"};
+    {"ping";      "icmp.ping"};
+    {"network";   "inet,wsock"};
+    {"download";  "inet.downBox,inet.httpFile"};
+    {"csv";       "string.csv"};
+    {"base64";    "crypt.bin"};
+    {"md5";       "crypt.hash"};
+    {"sha";       "crypt.hash"};
+    {"aes";       "crypt.aes"};
+    {"rsa";       "crypt.rsa"};
+    {"path";      "fsys.path,win.path,string.path"};
+    {"file";      "fsys.file,io.file"};
+    {"log";       "fsys.log,debug.log"};
+    {"watch";     "fsys.watch,fsys.dirWatcher"};
+    {"admin";     "process.admin"};
+    {"mutex";     "process.mutex,thread.semaphore"};
+    {"cpu";       "sys.cpu"};
+    {"memory";    "sys.mem"};
+    {"gui";       "win.form,win.ui"};
+    {"form";      "win.form,web.form"};
+    {"browser";   "web.view,web.form"};
+};
+
+var joinText = function(arr, sep){
+    var s = "";
+    for(i = 1; #arr; 1){
+        if(i > 1){ s = s ++ sep; }
+        s = s ++ S(arr[i]);
+    }
+    return s;
+};
+
+var stripSpace = function(s){
+    // WS 才是真空白字符集; 写成 " \t\r\n" 会变成 {空格,\,t,r,n} 去啃字母
+    return string.trim(S(s), WS);
+};
+
+var lastSeg = function(p){
+    p = S(p);
+    while(string.right(p, 1) == "/" || string.right(p, 1) == CH_BS){
+        p = string.left(p, #p - 1);
+    }
+    var parts = string.split(p, "/" ++ CH_BS);   // 字符集: 按 / 或 \ 任一字符切
+    if(parts[#parts]){ return parts[#parts]; }
+    return "";
+};
+
+// fsys.isDir 并非所有内核都有; 取不到时退化为「存在即视为目录」。
+// 不用比对返回值是否等于某个魔法数字: 不同版本返回的类型不一样(见过 16)。
+var isDirPath = function(p){
+    var ret = false;
+    if(!p){ return false; }
+    if(!io.exist(p)){ return false; }
+    try{
+        if(fsys.isDir(p)){ ret = true; }
+    }
+    catch(e){
+        // 老版本内核没有 fsys.isDir
+        ret = true;
+    }
+    return ret;
+};
+
+// 标准库根目录（<aardio安装目录>/lib）
+var libRoot = function(){
+    var exeDir = normPath(io.splitpath(io._exepath).dir);
+    return normPath(io.joinpath(exeDir, "lib"));
+};
+
+// 按 "." 切分（不用 string.split: 第二参是字符集, 传 "." 虽能用但语义模糊）
+var splitDots = function(name){
+    var out = {};
+    var s = 1;
+    while(true){
+        var d = string.indexOf(name, ".", s);
+        if(!d){
+            if(s <= #name){ table.push(out, string.right(name, #name - (s - 1))); }
+            break;
+        }
+        table.push(out, aacpkg.mid(name, s, d - s));
+        s = d + 1;
+    }
+    return out;
+};
+var joinDots = function(parts, from, to){
+    var s = "";
+    var a = from;
+    while(a <= to){
+        if(#s){ s = s ++ "."; }
+        s = s ++ parts[a];
+        a = a + 1;
+    }
+    return s;
+};
+
+// 由库名反查源文件的绝对路径。
+//
+// 【坑】aardio 的库文件名本身可以带点, 不能把模块名的点全换成斜杠:
+//      import fsys.dlg      ->  lib/fsys/dlg.aardio
+//      import fsys.dlg.dir  ->  lib/fsys/dlg.dir.aardio  (末两段连成文件名!)
+// 通则是「前 k-1 段当目录、第 k 段起用点连成文件名」, k 从 1 试到 n。
+//
+// 旧实现只试「全换斜杠」一种, 于是 fsys.dlg.dir 这种真实存在的库
+// 被判成"本机没有" —— 用户看到"请安装第三方库", 而它其实
+// 一条 host-add 就能补上。build.py 里那个存在性校验踩的是同一个坑,
+// 两边必须按同一套规则, 否则同一个库一个说有一个说没有。
+var libSourcePath = function(name){
+    name = S(name);
+    if(#name == 0){ return null; }
+    var segs = splitDots(name);
+    var n = #segs;
+    var root = libRoot();
+    var k = 1;
+    while(k <= n){
+        var d = "";
+        var a = 1;
+        while(a <= k - 1){
+            if(#d){ d = d ++ "/"; }
+            d = d ++ segs[a];
+            a = a + 1;
+        }
+        var fn = joinDots(segs, k, n);
+        var base = (#d) ? (d ++ "/" ++ fn) : fn;
+        var full = root ++ "/" ++ base;
+        var cands = {
+            normPath(full ++ ".aardio");
+            normPath(full ++ "/_.aardio");
+            normPath(full ++ "/main.aardio");
+        };
+        var c = 0;
+        for(c = 1; 3; 1){
+            if(fileExists(cands[c])){ return cands[c]; }
+        }
+        k = k + 1;
+    }
+    return null;
+};
+
+// ---- 内核内置命名空间 ----
+// aardio 内核直接提供, 不需要预埋、也不可能 host-add（压根没有源文件）。
+// 来源: <aardio>/lib/libs.txt 开头那一段。
+//
+// 【实证】10 多个开源工程里都写了 `import io;`。旧版 aac 把 io 报成
+// "宿主未预埋库" + "标准库里没有这个库", 用户只能干瞪眼。实测:
+// 用 --no-lib-check 强行编出来的独立 EXE 里 `io.exist()` 正常返回,
+// 根本没有 io 这个预埋项 —— 说明它是内核自带, 报缺纯属误报。
+var KERNEL_NS = {
+    "string"; "table"; "math"; "time"; "com"; "thread"; "fiber"; "raw"; "io";
+};
+
+// aardio 官方库总清单（<aardio>/lib/libs.txt, 约 930 条）。
+// 用途: 区分「官方库但本机没装」和「第三方库/拼错」—— 两者出路完全不同,
+// 前者 IDE 库管理器能装, 后者只能改代码。这个函数回答不了的时候返回 null。
+var _officialCache = null;
+var officialLibNames = function(){
+    if(_officialCache){ return _officialCache; }
+    _officialCache = {};
+    var f = normPath(io.joinpath(libRoot(), "libs.txt"));
+    if(!fileExists(f)){ return _officialCache; }
+    var txt = null;
+    try{ txt = string.load(f); } catch(e){ txt = null; }
+    if(!txt){ return _officialCache; }
+    // 【坑】不能用 "\n": 双引号里反斜杠不是转义, "\n" 就是两个字符。
+    var pos = 1;
+    while(true){
+        var nl = string.indexOf(txt, CH_LF, pos);
+        var line = null;
+        if(nl){
+            line = aacpkg.mid(txt, pos, nl - pos);
+            pos = nl + 1;
+        }
+        else {
+            line = string.right(txt, #txt - (pos - 1));
+            pos = #txt + 1;
+        }
+        line = string.trim(line);
+        if(#line && !string.startWith(line, "//")){ table.push(_officialCache, line); }
+        if(pos > #txt){ break; }
+    }
+    return _officialCache;
+};
+
+// ---- 不能预埋的库 ----
+// 【实测教训】winex.caret 顶部有 `if(_WIN7_LATER){ import System.Windows.Automation.3 }`。
+// 把它写进【宿主源码】后，宿主 EXE 一启动就要加载 UIA 程序集，
+// 结果每个用它打包出来的 EXE 全部卡死在启动阶段（120 秒超时，日志一行都没有），
+// 而原来只是干净地报一句 import failed —— 预埋反而把可诊断的失败变成了静默挂死。
+// 这类「import 时有重副作用」的库必须拦下。
+var RISKY_IMPORTS = {
+    "System.Windows.Automation";
+    "System.Windows.Forms";
+    "System.Windows.Media";
+    "winex.ctrl.notify";
+};
+var libRiskyImports = function(name){
+    var f = libSourcePath(name);
+    if(!f){ return null; }
+    var code = string.load(f);
+    if(!code){ return null; }
+    // 循环变量必须局部声明: 本函数可能在别的循环里被调用,
+    // 用全局 i 会把外层的迭代搅乱（项目里踩过一次）。
+    var k = 0;
+    for(k = 1; #RISKY_IMPORTS; 1){
+        if(string.indexOf(code, "import " ++ RISKY_IMPORTS[k])){
+            return RISKY_IMPORTS[k];
+        }
+    }
+    return null;
+};
+
+// ---- 实测会直接杀死产物的库（比 RISKY_IMPORTS 更硬的证据）----
+// RISKY_IMPORTS 属于"静态看着可疑"，这一档是**真发布 + 真跑过**的结论:
+//   ide         预埋后每一个产物 EXE 都是 rc=-1、日志文件一个字都没有。
+//               原因很直白: 它不是给独立 EXE 用的，导入时会去找 IDE 环境。
+//   java.jre.v8 import 期挂死（实测 15 秒以上无响应）
+//   inet.file   import 期直接抛错
+// 这三个是 host_grow.py 「加一批 → 发布 → 打真实 EXE 跑一遍」闭环里
+// 被刷下来的，不是猜的。 --force 仍可强行加, 但后果自负。
+var HOST_FATAL_LIBS = {
+    "ide";
+    "java.jre.v8";
+    "inet.file";
+};
+
+// ---- 会改写宿主赖以生存的全局名的库 ----
+// 【实测教训】wsock.tcp.simpleHttpServer / fastcgi.client 顶层都写着
+//     loadcode = function(path,...){ ... }
+// 而宿主正是用 loadcode(字节码) 把载荷跑起来的。预埋这两个库之后,
+// 每一个产物都静默失败: 退出码 -1, 日志文件一个字都没有 ——
+// 因为日志镜像本身也走 console.log, 而崩在更前面。
+// 更阴的是: 裸宿主(没打包载荷时)完全正常, 它压根不会调到 loadcode,
+// 所以"宿主自己能跑"根本不能证明预埋是安全的。必须静态扫出来。
+var HOST_CRITICAL_GLOBALS = {
+    "loadcode"; "dumpcode"; "string"; "console"; "io"; "table";
+    "dotNet"; "type"; "tostring"; "tonumber"; "PKG"; "loadModule";
+    "error"; "pcall";
+};
+// 返回该库顶层赋值过的全局名数组, 没有则返回 null
+var libOverridesGlobals = function(name){
+    var f = libSourcePath(name);
+    if(!f){ return null; }
+    var code = string.load(f);
+    if(!code){ return null; }
+    var out = {};
+    var pos = 1;
+    while(true){
+        var nl = string.indexOf(code, CH_LF, pos);
+        var line = null;
+        if(nl){
+            line = aacpkg.mid(code, pos, nl - pos);
+            pos = nl + 1;
+        }
+        else {
+            line = string.right(code, #code - (pos - 1));
+            pos = #code + 1;
+        }
+        var tl = string.trim(line);
+        var k = 0;
+        for(k = 1; #HOST_CRITICAL_GLOBALS; 1){
+            var g = HOST_CRITICAL_GLOBALS[k];
+            if(string.startWith(tl, g ++ "=") or string.startWith(tl, g ++ " =")){
+                if(!isOneOf(out, g)){ table.push(out, g); }
+            }
+        }
+        if(pos > #code){ break; }
+    }
+    if(#out == 0){ return null; }
+    return out;
+};
+
+// 扫描本机 aardio 标准库里真实存在的模块名（结果缓存）。
+// 遍历刻意用显式队列而不是递归: 递归的自我引用同样受「先定义后使用」
+// 规则影响, 没必要为省几行代码去冒运行时踩空的风险。
+var _libScanCache = null;
+var scanAvailableLibs = function(){
+    if(_libScanCache){ return _libScanCache; }
+    _libScanCache = {};
+    var exeDir = normPath(io.splitpath(io._exepath).dir);
+    var libDir = normPath(io.joinpath(exeDir, "lib"));
+    // 【坑】提前 return 绝不能写在 try 里面 —— try{} 里的 return 既不返回
+    // 也不生效(实测过)。所以这里的"库目录不存在"判断放在 try 之前。
+    if(!isDirPath(libDir)){ return _libScanCache; }
+
+    try{
+        var queue = {};
+        table.push(queue, {dir = libDir; prefix = ""; depth = 0});
+        var head = 1;
+        while(head <= #queue && #_libScanCache < 1200){
+            var task = queue[head];
+            head = head + 1;
+            if(task.depth <= 2){
+                fsys.enum(task.dir, "*.aardio", function(d, filename, fullpath){
+                    if(!filename){ return true; }
+                    if(#_libScanCache >= 1200){ return false; }
+                    var stem = string.left(filename, #filename - 7);
+                    if(stem == "_"){
+                        // lib/xxx/_.aardio 代表命名空间 xxx 本身可 import
+                        if(#task.prefix){ table.push(_libScanCache, task.prefix); }
+                    }
+                    elseif(#stem){
+                        if(#task.prefix){
+                            table.push(_libScanCache, task.prefix ++ "." ++ stem);
+                        }
+                        else {
+                            table.push(_libScanCache, stem);
+                        }
+                    }
+                    return true;
+                }, false);
+
+                if(task.depth < 2){
+                    // 【坑】fsys.enum 对目录条目回调时:
+                    //   d        = 目录「名字」(不是路径!)
+                    //   filename = null
+                    //   fullpath = 目录的完整路径
+                    // 早期版本把 d 当成路径塞回队列, 结果二级目录全部遍历为空,
+                    // 于是 lib/winex/caret.aardio 这种明明存在的库会被判成"没有"。
+                    fsys.enum(task.dir, "*.*", function(d, filename, fullpath){
+                        if(filename){ return true; }
+                        var dn = lastSeg(S(d) or S(fullpath));
+                        if(#dn == 0 || dn == "." || dn == ".."){ return true; }
+                        if(string.left(dn, 1) == "."){ return true; }
+                        var sub = fullpath;
+                        if(!sub){ sub = task.dir ++ "/" ++ dn; }
+                        var np = (#task.prefix ? task.prefix ++ "." ++ dn : dn);
+                        table.push(_libScanCache, np);
+                        if(#queue < 400){
+                            table.push(queue, {dir = normPath(sub); prefix = np; depth = task.depth + 1});
+                        }
+                        return true;
+                    }, false);
+                }
+            }
+        }
+    }
+    catch(e){
+        // 扫描失败不影响主流程, 只是没有「你是不是想找 XX」的建议
+    }
+    return _libScanCache;
+};
+
+// 在给定候选清单里为一个名字找近似项
+var suggestFrom = function(avail, name){
+    var res = {};
+    var flat = string.lower(S(name));
+    if(#flat == 0){ return res; }
+
+    // 1) 别名表精确命中（候选必须是本机真实存在的库）
+    for(i = 1; #LIB_ALIAS; 1){
+        if(string.lower(LIB_ALIAS[i][1]) == flat){
+            var maps = string.split(LIB_ALIAS[i][2], ",");
+            for(j = 1; #maps; 1){
+                if(isOneOf(avail, maps[j])){ table.push(res, maps[j]); }
+            }
+            if(#res){ return res; }
+            break;
+        }
+    }
+
+    // 2) 实际库名里做包含匹配（忽略大小写）
+    for(i = 1; #avail; 1){
+        if(#res >= 6){ break; }
+        var lc = string.lower(avail[i]);
+        if(lc == flat){ table.push(res, avail[i]); }
+        elseif(string.indexOf(lc, flat) || string.indexOf(flat, lc)){
+            table.push(res, avail[i]);
+        }
+    }
+
+    // 3) 末段匹配: 想要 xxx.uuid 时提示 string.uuid
+    if(#res == 0){
+        var tail = lastSeg(flat);
+        if(#tail > 1){
+            for(i = 1; #avail; 1){
+                if(#res >= 6){ break; }
+                if(lastSeg(string.lower(avail[i])) == tail){
+                    table.push(res, avail[i]);
+                }
+            }
+        }
+    }
+    return res;
+};
+
+// 本机专属的路径提示：<aac.exe 所在目录>/aac.local.txt，形如 AAC_HOME=D:\xxx。
+//
+// 【为什么需要它】开源仓库里不能写死任何人的绝对路径 —— 这里原先末尾挂着一句
+//     table.push(cands, "<作者本机的仓库路径>/" ++ fname);
+// 那是作者本机的路径：clone 到别人机器上既找不到，还把自己的目录结构带了出去。
+// 但删掉之后，用户在**任意位置** clone 的仓库就找不到了。
+// 折中办法：把"我自己的路径"放在一个**不属于仓库**的小配置文件里
+// （build.py 发布时会自动生成一份），鱼与熊掌兼得。
+var localHintRoots = function(){
+    var out = {};
+    var hint = normPath(io.joinpath(normPath(io.splitpath(io._exepath).dir),
+                                    "aac.local.txt"));
+    if(!fileExists(hint)){ return out; }
+    var txt = null;
+    try{ txt = string.load(hint); } catch(e){ txt = null; }
+    if(!txt){ return out; }
+    var pos = 1;
+    while(true){
+        var nl = string.indexOf(txt, CH_LF, pos);
+        var line = null;
+        if(nl){
+            line = aacpkg.mid(txt, pos, nl - pos);
+            pos = nl + 1;
+        }
+        else {
+            line = string.right(txt, #txt - (pos - 1));
+            pos = #txt + 1;
+        }
+        line = string.trim(line);
+        if(#line and !string.startWith(line, "#")){
+            var eq = string.indexOf(line, "=");
+            if(eq){
+                var key = stripSpace(aacpkg.mid(line, 1, eq - 1));
+                if(key == "AAC_HOME"){
+                    var val = stripSpace(string.right(line, #line - eq));
+                    if(#val){ table.push(out, normPath(val)); }
+                }
+            }
+        }
+        if(pos > #txt){ break; }
+    }
+    return out;
+};
+
+// 从「本机提示 + 用户当前目录 + aac.exe 所在目录」逐级向上找文件。
+//
+// 【为什么要三个起点】EXE 通常被发布到 aardio 安装目录（**不在本仓库里**），
+// 而用户是在自己 clone 出来的仓库里敲 host-add / host-del 的 —— 只从 EXE
+// 所在目录往上找，别人把仓库 clone 到别处就永远找不到宿主源码。
+//
+// 候选路径必须逐级显式展开, 不能图省事写 dir = dir ++ "/../.." ——
+// 项目里已踩过「两级 .. 实际只上溯一级」的坑（见 memory）。
+var findFileUpwards = function(fname){
+    var starts = {};
+    // 1) 本机提示（最高优先，等价于过去那句写死的绝对路径，但不在仓库里）
+    var hr = localHintRoots();
+    for(i = 1; #hr; 1){ table.push(starts, hr[i]); }
+    // 2) 用户敲命令的目录（aac.cmd 会把它注入成 --cwd）
+    if(cwdBase){ table.push(starts, cwdBase); }
+    // 3) EXE 自己所在的目录
+    table.push(starts, normPath(io.splitpath(io._exepath).dir));
+
+    var cands = {};
+    var s = 0;
+    for(s = 1; #starts; 1){
+        var dir = starts[s];
+        for(i = 1; 5; 1){
+            table.push(cands, normPath(io.joinpath(dir, fname)));
+            table.push(cands, normPath(io.joinpath(dir, "AardioCompile") ++ "/" ++ fname));
+            dir = normPath(dir ++ "/..");
+            if(dir == "/" || #dir <= 3){ break; }
+        }
+    }
+    for(i = 1; #cands; 1){
+        if(io.exist(cands[i])){ return cands[i]; }
+    }
+    return null;
+};
+
+// ------------------------------------------------------------
+//  缺库报告（由 cmdBuild 的依赖检查调用）
+// ------------------------------------------------------------
+// 分成两类给出不同出路, 而不是丢一句「自己去看源码」:
+//   A. 标准库里有、只是宿主没预埋 -> 一条命令可以自动补
+//   B. 标准库里真没有                 -> 可能是第三方库或名字写错
+var reportMissingLibs = function(miss){
+    var avail = scanAvailableLibs();
+    var official = officialLibNames();
+    var addable = {};
+    var needInstall = {};
+    var others = {};
+
+    // 三类, 出路完全不同 —— 混在一起说"自己去看源码"是废物诊断:
+    //   A. 本机已装, 只是宿主没预埋   -> aac host-add, 不用联网
+    //   B. 官方库但本机没装           -> IDE 库管理器装一次(需联网), 之后 host-add
+    //   C. 官方清单里也没有           -> 第三方库或拼错, 只能改代码
+    for(i = 1; #miss; 1){
+        if(isOneOf(avail, miss[i].lib)){ table.push(addable, miss[i]); }
+        elseif(#official && isOneOf(official, miss[i].lib)){ table.push(needInstall, miss[i]); }
+        else { table.push(others, miss[i]); }
+    }
+
+    if(#addable){
+        emit("");
+        emit("【A类】本机 aardio 里就有，只是宿主没预埋 —— 不需要联网下载:");
+        var names = {};
+        for(i = 1; #addable; 1){
+            emit("  " ++ addable[i].lib ++ "   （被 " ++ addable[i].from ++ " 引用）");
+            table.push(names, addable[i].lib);
+        }
+        emit("");
+        emit("一条命令自动补上并重建宿主:");
+        emit("    aac host-add " ++ joinText(names, ",") ++ " --rebuild");
+        emit("（不加 --rebuild 则只改源码并打印接下来要执行的命令）");
+    }
+
+    if(#needInstall){
+        emit("");
+        emit("【B类】是 aardio 官方库，但本机还没装 —— 需要先联网装一次:");
+        var inames = {};
+        for(i = 1; #needInstall; 1){
+            emit("  " ++ needInstall[i].lib ++ "   （被 " ++ needInstall[i].from ++ " 引用）");
+            table.push(inames, needInstall[i].lib);
+        }
+        emit("");
+        emit("  装法: 打开 aardio IDE -> 工具 -> 库管理器 -> 搜索上面的名字 -> 安装");
+        emit("  装完再执行:  aac host-add " ++ joinText(inames, ",") ++ " --rebuild");
+        emit("  （官方库都在 aardio 自己的仓库里, 装一次即可, 之后永久可用）");
+    }
+
+    if(#others){
+        emit("");
+        for(i = 1; #others; 1){
+            err("【C类】官方库清单里没有: " ++ others[i].lib
+                ++ "   （被 " ++ others[i].from ++ " 引用）");
+            var sg = suggestFrom(avail, others[i].lib);
+            if(#sg){
+                emit("    你是不是想用: " ++ joinText(sg, ", "));
+                emit("    如果是，请改 import；并按上面方式补库。");
+            }
+            else {
+                emit("    两种可能:");
+                emit("      a) 第三方库 —— 请先用 aardio IDE 的「库管理器」安装到本机，");
+                emit("         安装成功后再执行上面的 aac host-add 命令；");
+                emit("      b) 它其实是本工程自己的模块名或敲错了 —— 请检查 import 拼写。");
+            }
+        }
+    }
+
+    emit("");
+    emit("跳过检查: 加 --no-lib-check（编译照常通过，但生成的 EXE 运行时才会报错）");
+    emit("不受预埋限制的运行方式: aac exec <xxx.appkg>");
+};
+
+// ============================================================
+//  命令行解析
+// ============================================================
+
+var rawArgs = _ARGV;
+var cmd = null;
+var positional = {};
+var passthrough = {};      // "--" 之后的参数, 原样透传给脚本
+var opts = {};
+var unknownOpts = {};
+
+// 需要跟值的选项（既支持 --out=x 也支持 --out x）
+var valOpts = {"--out"; "--ver"; "--host"; "--log"; "--exclude"; "--name"; "--cwd"};
+// 全部合法选项。出现清单外的 --xxx 一律报错,
+// 否则拼错参数会被静默忽略, 用户以为生效了其实没生效。
+// 【踩过的坑】新增选项只写进 valOpts（取值表）却漏写 allOpts（合法表）
+// 的话, 该选项会被当"拼错"直接拒绝, 而 opts[...] 又在同一分支里赋值,
+// 于是帮助里写着支持、实际一用就 rc=1。两份清单必须同步,
+// 加选项时务必同时改这两行。
+var allOpts = {
+    "--out"; "--ver"; "--host"; "--log"; "--exclude"; "--name"; "--cwd";
+    "--no-pause"; "--no-exe"; "--no-lib-check"; "--quiet"; "-q"; "--rebuild";
+    "--force"; "--auto-host";
+};
+// 既可作子命令也可作开关: 未取得 cmd 时当作子命令处理
+var cmdLikeOpts = {"--help"; "-h"; "--version"; "-V"};
+
+// 防御: 取值型选项自动并入合法清单。
+// 这样以后新增选项即便只改了 valOpts, 也不会落到"对自己选项报未知参数"的
+// 荒谬状态 —— 而对用户拼错的选项, unknownOpts 的严格校验依然完整保留。
+for(_vi = 1; #valOpts; 1){
+    if(!isOneOf(allOpts, valOpts[_vi])){
+        table.push(allOpts, valOpts[_vi]);
+    }
+}
+
+var sawSep = false;
+var i = 1;
+while(i <= #rawArgs){
+    var a = S(rawArgs[i]);
+    if(!sawSep && a == "--"){
+        sawSep = true;
+    }
+    elseif(sawSep){
+        table.push(passthrough, a);
+    }
+    elseif(string.startWith(a, "-")){
+        if(!cmd && isOneOf(cmdLikeOpts, a)){
+            cmd = a;
+        }
+        else {
+            // 校验时必须只看 "=" 前面的选项名:
+            // "--log=x" 整体拿去比对合法清单是匹配不上的, 会把合法项误判成拼错。
+            var eq0 = string.indexOf(a, "=");
+            var nmOpt = a;
+            if(eq0){ nmOpt = string.left(a, eq0 - 1); }
+            if(!isOneOf(allOpts, nmOpt)){
+                table.push(unknownOpts, a);
+            }
+            var eq = string.indexOf(a, "=");
+            if(eq){
+                opts[string.left(a, eq - 1)] = string.right(a, #a - eq);
+            }
+            else {
+                if(isOneOf(valOpts, a) && i < #rawArgs && !string.startWith(S(rawArgs[i + 1]), "-")){
+                    opts[a] = S(rawArgs[i + 1]);
+                    i = i + 1;
+                }
+                else {
+                    opts[a] = "";
+                }
+            }
+        }
+    }
+    elseif(!cmd){
+        cmd = a;
+    }
+    else {
+        table.push(positional, a);
+    }
+    i = i + 1;
+}
+
+var hasOpt = function(name){
+    return opts[name] != null;
+};
+var optVal = function(name){
+    var v = opts[name];
+    if(v == null){ return null; }
+    if(#v == 0){ return null; }
+    return v;
+};
+
+// 交给脚本的参数: 有 "--" 就用它后面的原文, 否则退化为子命令之后的位置参数
+var scriptArgs = function(){
+    if(#passthrough){ return passthrough; }
+    var t = {};
+    var m = 0;
+    for(m = 2; #positional; 1){
+        table.push(t, positional[m]);
+    }
+    return t;
+};
+
+// ============================================================
+//  工作目录基准（--cwd）
+// ============================================================
+// 【已实测的事实】aardio 发布的独立 EXE，在任何用户代码执行之前就把
+// 当前目录切到了 EXE 所在目录。验证方式：
+//   写一个不含任何 import 的脚本，第一条语句读 CWD —— 依然是 EXE 目录；
+//   把 EXE 改名、换到其他目录，CWD 依然跟着 EXE 自己。
+// 因此进程内无法取回调用方的当前目录，命令行里的相对路径会被解析成
+// "<EXE目录>/xxx"，表现为「文件明明就在眼前却说找不到」。
+//
+// 出路只有一条：让调用方显式告知基准目录。--cwd 拿到后立即 setCurDir，
+// 进程内所有相对路径行为就恢复正常了。CI 里建议写死；交互式命令行建议
+// 用随包提供的 aac.cmd（它自动把 %CD% 注入成 --cwd）。
+// ---- 自动找回调用方的当前目录（cmd.exe 下有效）----
+// 上面那句"进程内无法得知调用方当前目录"其实留了个口子：cmd.exe 会为每个
+// 驱动器维护一个隐藏环境变量 "<盘符>:=<该盘当前目录>"（per-drive CWD），
+// 并且会随 CreateProcess 一起继承给子进程 —— 连名字里带 "=" 的这个怪变量也继承。
+// 实测在 cmd 里 `cd /d D:\x\y` 之后启动本 EXE：
+//     string.getenv("=D:")    -> D:\x\y        ← 调用方站的地方
+//     io.fullpath(".")        -> <EXE目录>      ← 依旧是被劫持的
+// 两者互补，于是交互式用法不必再强制带 --cwd。
+//
+// 【只在恰有一个盘符变量时才采用】cmd 里 cd 过多盘会留下多条记录，
+// 那种情况下谁也分不清用户到底站在哪个盘 —— 宁可按旧行为明确报错，也不要猜错目录。
+// PowerShell / Python subprocess 不维护这些变量 → 取不到 → 自动退回旧行为，
+// 三件套提示照旧给出，不会出现"忽然跑到某个陌生目录去写文件"。
+var recoverCallerCwd = function(){
+    if(type(string.getenv) != "function"){ return null; }
+    var letters = { "C"; "D"; "E"; "F"; "G"; "H"; "I"; "J"; "K"; "L"; "M";
+                    "N"; "O"; "P"; "Q"; "R"; "S"; "T"; "U"; "V"; "W"; "X"; "Y"; "Z" };
+    var hit = null;
+    var n = 0;
+    for(i = 1; #letters; 1){
+        var v = string.getenv("=" ++ letters[i] ++ ":");
+        if(v && #v){
+            n = n + 1;
+            if(n > 1){ return null; }   // 有歧义就不猜
+            hit = v;
+        }
+    }
+    if(n != 1 or !hit){ return null; }
+    hit = normPath(hit);
+    if(!isDirPath(hit)){ return null; }
+    return hit;
+};
+
+// 先算出基准目录，但暂不应用 —— 必须让日志镜像先起来。
+// 顺序很关键: 日志建立之前的任何报错只会写进控制台，而 CI 里控制台输出
+// 要么被重定向、要么根本不可见，表现为「进程静默返回 1，零线索」。
+var cwVal = optVal("--cwd");
+var cwAbs = null;
+var cwBad = null;
+var cwAuto = null;
+if(cwVal && #cwVal){
+    cwAbs = normPath(io.fullpath(cwVal));
+    if(!isDirPath(cwAbs)){
+        cwBad = cwAbs;
+        cwAbs = null;
+    }
+}
+else {
+    // 没给 --cwd：试着从 cmd 继承下来的盘符变量里把真实当前目录捞回来。
+    // 拿不到也无所谓，后面照旧给出那三条可行动提示。
+    cwAuto = recoverCallerCwd();
+    if(cwAuto){
+        cwAbs = cwAuto;
+        cwVal = cwAuto;
+    }
+}
+
+// ---- 输入路径找不到时给可行动提示，而不是只有一句 "不存在" ----
+var isAbsPath = function(p){
+    p = S(p);
+    if(string.indexOf(p, ":") == 2){ return true; }
+    var c0 = string.left(p, 1);
+    if(c0 == "/" || c0 == CH_BS){ return true; }   // aardio 语义: 斜杠开头=应用基准目录
+    return false;
+};
+
+// what: 给调用方的名词（工程路径 / 源文件 / 脚本文件 / 包文件），
+//       保留「xxx不存在」的可 grep 措辞，再附可行动提示。
+var notFoundInput = function(what, rawVal, absVal){
+    err(what ++ "不存在: " ++ S(rawVal));
+    err("   解析为: " ++ S(absVal));
+    if(!cwdBase && !isAbsPath(rawVal)){
+        emit("");
+        err("原因: aardio 发布的独立 EXE 启动时会把当前目录强制设为 EXE 所在目录");
+        err("      " ++ normPath(io.splitpath(io._exepath).dir));
+        err("      因此命令行里的相对路径不会按你在终端里的当前目录解析。");
+        emit("");
+        emit("请改用下面任一写法:");
+        emit("  1) 绝对路径       aac build D:/path/to/proj");
+        emit("  2) 显式基准目录   aac build proj --cwd=D:/path/to");
+        // cmd.exe 下上面这段一般到不了 —— 启动时已自动从 cmd 继承的
+        // "<盘符>:=<当前目录>" 里把真实位置捞回来了（见 recoverCallerCwd）。
+        // 这里多半是 PowerShell / Git-Bash 用户：它们不维护这种变量，
+        // 只能靠 aac.cmd 包装器把 %CD% 注入进来。
+        emit("  3) PowerShell / Git-Bash 下请用随包的 aac.cmd（自动注入当前目录）");
+    }
+};
+
+if(hasOpt("--no-pause")){ noPauseFlag = true; }
+if(hasOpt("--quiet") || hasOpt("-q")){ quietFlag = true; }
+if(optVal("--log")){
+    var lg = S(optVal("--log"));
+    // 相对日志路径要跟着 --cwd 走，否则排错时还会再踩一次「日志去哪了」
+    if(cwAbs && !isAbsPath(lg)){
+        var lgHead = string.left(lg, 1);
+        if(lgHead == "/" || lgHead == CH_BS){
+            logPath = normPath(io.fullpath(lg));   // aardio 语义: 斜杠开头=应用基准目录
+        }
+        else {
+            logPath = normPath(cwAbs ++ "/" ++ lg);
+        }
+    }
+    else {
+        logPath = normPath(io.fullpath(lg));
+    }
+}
+
+// 指定 --log 即视为无人值守场景, 自动禁用结尾暂停
+if(logPath){ noPauseFlag = true; }
+
+// ---- 日志镜像 ----
+// console.log 经由 WriteConsoleB 直写控制台句柄, 重定向到文件/管道时拿不到输出。
+// 这里在 console.log 上做镜像, 用「追加写」而不是每次全量读回重写
+// (旧实现每次 log 都 string.load 整个文件, 大工程下是 O(n^2))。
+if(logPath){
+    ensureDir(parentDir(logPath));
+    // 见 CP_UTF8 处的说明: string.save 是字节直通, 这里的第三参数 false=覆盖写,
+    // 第四参数不影响编码。真正会乱码的是控制台, 不是这个文件。
+    string.save(logPath, "", false, CP_UTF8);
+    var rawLog = console.log;
+    console.log = function(...){
+        var va = {...};
+        var buf = "";
+        for(k = 1; #va; 1){
+            if(k > 1){ buf = buf ++ CH_TAB; }
+            buf = buf ++ S(va[k]);
+        }
+        string.save(logPath, buf ++ CRLF, true, CP_UTF8);
+        return rawLog(...);
+    };
+}
+
+// 日志已经可用，到这里才校验并应用基准目录 —— 失败也能在日志里看到原因
+if(cwBad){
+    err("--cwd 指定的目录不存在（或不是目录）: " ++ cwBad);
+    pauseIfNeed();
+    hardExit(1);
+    return 1;
+}
+if(cwAbs){
+    cwdBase = cwAbs;
+    fsys.setCurDir(cwAbs);
+}
+
+// ============================================================
+//  帮助
+// ============================================================
+
+var showHelp = function(){
+    emit("aac " ++ AAC_VERSION ++ " —— aardio 命令行编译器（dumpcode 模式，不依赖 IDE）");
+    emit("");
+    emit("用法:");
+    emit("  aac build   <工程目录|.aproj> [选项]");
+    emit("  aac compile <源文件.aardio> <输出.dump> [选项]");
+    emit("  aac run     <脚本.aardio|.dump> [脚本参数...] [选项]");
+    emit("  aac exec    <包文件.appkg> [脚本参数...] [选项]");
+    emit("  aac info    <包文件.appkg|独立EXE> [选项]");
+    emit("  aac libs                               [选项]");
+    emit("  aac host-add <库名>[,<库名>...] [--rebuild]");
+    emit("  aac host-del <库名>[,<库名>...] [--rebuild]");
+    emit("  aac version");
+    emit("  aac help");
+    emit("");
+    emit("子命令:");
+    emit("  build     编译完整工程 -> .appkg + 独立 EXE（需 aardioHost.exe）");
+    emit("  compile   编译单文件 .aardio -> .dump 字节码");
+    emit("  run       编译并执行 .aardio 源码或 .dump 字节码");
+    emit("  exec      加载 .appkg 并执行包内 main.aardio");
+    emit("  info      打印包内元信息与文件清单（排错用）");
+    emit("  libs      列出 aardioHost.exe 预埋的标准库");
+    emit("  host-add  给宿主补标准库（自动改源码 + 哨兵清单，--rebuild 直接重建）");
+    emit("  host-del  从宿主剔除库（加错了只能删掉重建，命令同时改 import 与哨兵）");
+    emit("");
+    emit("build 选项:");
+    emit("  --out=路径        输出目录，或具体文件（*.exe / *.appkg）");
+    emit("  --name=应用名     覆盖应用名（默认取 .aproj 的 output）");
+    emit("  --ver=版本号      覆盖版本号（默认取 .aproj 的 FileVersion）");
+    emit("  --host=路径       指定 aardioHost.exe（默认在 aac 同目录/上级目录找）");
+    emit("  --no-exe          只生成 .appkg，不生成独立 EXE");
+    emit("  --no-lib-check    跳过宿主预埋库依赖检查");
+    emit("  --auto-host       缺库时自动 host-add 并重建宿主，一条命令闭环");
+    emit("  --force           允许预埋有重副作用的库（如会拉起 UIA 的 winex.caret）");
+    emit("  --exclude=a,b     追加排除的目录名（默认已排除 dist/.build/.git 等）");
+    emit("");
+    emit("公共选项:");
+    emit("  --cwd=目录        指定相对路径的基准目录（见下方【当前目录】）");
+    emit("  --no-pause        禁止结束暂停（CI 必须加）");
+    emit("  --log=文件        把全部输出镜像落盘（自动隐含 --no-pause）");
+    emit("  --quiet / -q      只输出 [OK]/[ERR]/[WARN]");
+    emit("  --                之后的参数原样透传给脚本，不再按 aac 选项解释");
+    emit("");
+    emit("【当前目录】aardio 发布的独立 EXE 会在任何用户代码执行前把当前目录");
+    emit("   强制切到 EXE 所在目录，进程内无法取回调用方的当前目录。");
+    emit("   因此相对路径不会按你在终端里的当前目录解析。请三选一:");
+    emit("     1) 写绝对路径          aac build D:/path/to/proj");
+    emit("     2) 显式给基准目录      aac build proj --cwd=D:/path/to");
+    emit("     3) 改用随包的 aac.cmd  它会自动把当前目录注入成 --cwd");
+    emit("");
+    emit("【库从哪来】aardio 的标准库随安装一次性装全，缺库不需要联网下载，");
+    emit("   缺的是「被嵌进宿主 EXE」这一步 —— 用 aac host-add 补即可。");
+    emit("   只有第三方库才需要先在 aardio IDE 的「库管理器」里安装。");
+    emit("");
+    emit("退出码:");
+    emit("  0   成功");
+    emit("  1   失败");
+    emit("  n   run/exec/独立EXE：被调脚本 main 返回的数字（0~255）");
+    emit("");
+    emit("提示: console.log 直写控制台句柄, 管道/重定向抓不到输出,");
+    emit("      CI 排错请务必带 --log。");
+};
+
+var showVersion = function(){
+    emit("aac " ++ AAC_VERSION);
+    emit("包格式 : v" ++ aacpkg.FORMAT_VER);
+    emit("内核指纹: " ++ aacpkg.kernelStamp());
+};
+
+// ============================================================
+//  参数合法性校验
+// ============================================================
+
+// 未知选项必须拦掉。旧实现静默忽略, 结果 --outt=xxx 之类的拼写错误
+// 会让产物落到默认位置, 用户完全察觉不到。
+// 循环变量局部化, 避免与调用方互相覆盖
+var checkArgs = function(){
+    if(!#unknownOpts){ return true; }
+    var m = 0;
+    for(m = 1; #unknownOpts; 1){
+        err("未知参数: " ++ unknownOpts[m]);
+    }
+    emit("");
+    emit("若这些参数是给脚本用的，请用 -- 分隔：aac exec pkg --no-pause -- <脚本参数>");
+    emit("");
+    showHelp();
+    pauseIfNeed();
+    hardExit(1);
+    return false;
+};
+
+// ============================================================
+//  .aproj 解析（XML 宽容解析）
+// ============================================================
+
+// aardio 的 string.find / string.match 走「模式匹配」语法, 其中 <...>
+// 是特殊结构(平衡匹配), 模式串里出现未闭合的 '<' 会抛 malformed pattern。
+// XML 里到处是 '<' '>', 因此解析一律用 string.indexOf（纯子串查找）。
+var makeXmlReader = function(xml){
+    var r = {};
+    r.xml = xml;
+
+    // .aproj 首行是 XML 声明 <?xml version="1.0" encoding="utf-8"?>。
+    // 旧实现取「全文第一个 '>'」作为标签结束位置, 结果 head 被截到声明处,
+    // output / FileVersion / publishDir 全部读到 null（版本号回退成 1.0.0,
+    // 产物也不落在 publishDir 里）。必须先把正文移到真正的 <project ...> 标签。
+    var ps = string.indexOf(r.xml, "<project");
+    if(ps){
+        r.xml = string.right(r.xml, #r.xml - (ps + 7));
+    }
+
+    // 取 <project ...> 的属性区（到该标签的 '>' 为止）
+    r.head = null;
+    var gt0 = string.indexOf(r.xml, ">");
+    if(gt0){ r.head = string.left(r.xml, gt0 - 1); }
+
+    r.field = function(tag){
+        if(!r.xml){ return null; }
+        var s = string.indexOf(r.xml, "<" ++ tag);
+        if(!s) return null;
+        var gt = string.indexOf(r.xml, ">", s);
+        if(!gt) return null;
+        var body = string.right(r.xml, #r.xml - gt);
+        var close = string.indexOf(body, "</");
+        if(!close) return null;
+        return string.left(body, close - 1);
+    };
+
+    r.attr = function(name){
+        if(!r.head){ return null; }
+        // 含双引号的字面量必须用反引号原义串（双引号串里 \" 不是转义）
+        var p = string.indexOf(r.head, name ++ `="`);
+        if(!p) return null;
+        var rest = string.right(r.head, #r.head - (p + #name + 1));
+        var q = string.indexOf(rest, `"`);
+        if(!q) return null;
+        return string.left(rest, q - 1);
+    };
+
+    return r;
+};
+
+// 判断 import 的名字是不是「工程自己的模块」而非第三方/标准库。
+// 工程里有 lib/utils.aardio 时, 源码里的 import utils 是内部模块, 不该判缺失。
+// 循环变量全部局部声明: 这些函数在 cmdBuild 的循环体里被调用,
+// 一旦共用全局 i/j/k 就会把外层的迭代指针冲掉
+var isProjectModule = function(nm, files){
+    var parts = string.split(nm, ".");
+    var p = "";
+    var q = 0;
+    for(q = 1; #parts; 1){
+        if(q > 1){ p = p ++ "/"; }
+        p = p ++ parts[q];
+    }
+    // 【坑】工程根目录下的 lib/ 也会被 aardio 加进 import 搜索路径:
+    // lib/config.aardio 就是 `import config` 的目标。
+    // 只比对根目录这一条时, 真实工程里大量自带模块会被误报成
+    // "宿主未预埋库" —— 实测 126 个开源工程里 config/style/etip 之类
+    // 满屏都是, 全是假阳性。必须把 lib/ 前缀也算进去。
+    var cands = {
+        p ++ ".aardio";
+        "lib/" ++ p ++ ".aardio";
+        p ++ "/_.aardio";
+        "lib/" ++ p ++ "/_.aardio";
+        p ++ "/main.aardio";
+        "lib/" ++ p ++ "/main.aardio";
+    };
+    var k = 0;
+    for(q = 1; #files; 1){
+        var rel = files[q].rel;
+        for(k = 1; #cands; 1){
+            if(rel == cands[k]){ return true; }
+        }
+    }
+    return false;
+};
+
+// ---- 定位运行时宿主 ----
+// 结果缓存: 依赖检查和生成 EXE 都要用它, 避免重复读盘。
+var hostResolved = false;
+var hostResolvedPath = null;
+
+var locateHost = function(){
+    if(hostResolved){ return hostResolvedPath; }
+    hostResolved = true;
+    hostResolvedPath = null;
+
+    var hp = optVal("--host");
+    if(hp){
+        hp = normPath(io.fullpath(hp));
+        if(!fileExists(hp)){
+            warn("--host 指定的文件不存在: " ++ hp);
+            hp = null;
+        }
+    }
+    if(!hp){
+        var toolDir = normPath(io.splitpath(io._exepath).dir);
+            var cands = {
+                toolDir ++ "/aardioHost.exe";
+                normPath(toolDir ++ "/..") ++ "/aardioHost.exe";
+            };
+            for(q = 1; #cands; 1){
+                if(fileExists(cands[q])){
+                    hp = cands[q];
+                    break;
+                }
+            }
+    }
+    hostResolvedPath = hp;
+    return hp;
+};
+
+// ============================================================
+//  子命令: build
+// ============================================================
+
+var cmdBuild = function(){
+    // --- 1. 工程路径 ---
+    var projArg = positional[1];
+    if(!projArg){
+        err("请指定工程路径");
+        emit("用法: aac build <工程目录|.aproj> [--out=路径] [--name=应用名] [--no-pause]");
+        pauseIfNeed();
+        return 1;
+    }
+
+    var projRaw = projArg;
+    projArg = normPath(io.fullpath(projArg));
+    if(!fileExists(projArg)){
+        notFoundInput("工程路径", projRaw, projArg);
+        pauseIfNeed();
+        return 1;
+    }
+
+    // --- 2. 工程目录与 .aproj ---
+    var projDir  = null;
+    var projFile = null;
+
+    if(string.endWith(projArg, ".aproj", true)){
+        projFile = projArg;
+        projDir  = parentDir(projArg) || ".";
+    }
+    else {
+        projDir = projArg;
+        fsys.enum(projDir, "*.aproj", function(dir, filename, fullpath){
+            if(filename && !projFile){
+                projFile = normPath(fullpath);
+            }
+        }, false);
+    }
+    projDir = normPath(projDir);
+
+    info("工程目录: " ++ projDir);
+    if(projFile){
+        info("工程文件: " ++ projFile);
+    }
+    else {
+        warn("未找到 .aproj 文件，应用名/版本将取默认值");
+    }
+
+    var xml = null;
+    if(projFile && fileExists(projFile)){
+        xml = string.load(projFile);
+    }
+    var xr = makeXmlReader(xml);
+
+    // --- 3. 应用名 / 版本 / 输出目录 ---
+    var appName = optVal("--name");
+    if(!appName){
+        appName = xr.attr("output");
+    }
+    if(!appName || !#appName){
+        var nameTags = {"OutFileName"; "OutputFileName"; "OutputFile"; "FileName"; "Name"};
+        for(i = 1; #nameTags; 1){
+            var t = xr.field(nameTags[i]);
+            if(t && #t){ appName = t; break; }
+        }
+    }
+    if(!appName || !#appName){
+        appName = xr.attr("name");
+    }
+
+    var ver = optVal("--ver");
+    if(!ver){ ver = xr.attr("FileVersion"); }
+    if(!ver){ ver = xr.field("Version"); }
+    if(!ver || !#ver){ ver = "1.0.0"; }
+
+    // publishDir: .aproj 里形如 "/dist/"
+    var pubDir = xr.attr("publishDir");
+    var outDir = projDir;
+    if(pubDir && #pubDir){
+        var pd = normPath(pubDir);
+        // 可能是 "/dist/" 这种以斜杠开头的相对写法
+        pd = string.replace(pd, CH_BACKSLASH, "/");
+        while(string.left(pd, 1) == "/"){
+            pd = string.right(pd, #pd - 1);
+        }
+        if(#pd){
+            outDir = normPath(projDir ++ "/" ++ pd);
+        }
+    }
+
+    // --- 4. 解析 --out ---
+    // 语义（重要，旧版本在这里会把 .appkg 直接写成 .exe）:
+    //   以 / 或 \ 结尾, 或不含扩展名  -> 目录
+    //   以 .exe 结尾                  -> 独立 EXE 的完整路径
+    //   以 .appkg 结尾                -> 包文件的完整路径
+    var cliOut = optVal("--out");
+    var outPkg = null;
+    var outExe = null;
+
+    if(cliOut){
+        var co = normPath(cliOut);
+        var isExeOut = string.endWith(co, ".exe", true);
+        var isPkgOut = string.endWith(co, ".appkg", true);
+
+        if(isExeOut || isPkgOut){
+            var abs = normPath(io.fullpath(co));
+            var dir = parentDir(abs);
+            var nm  = stripExt(baseName(abs));
+            if(#nm){ appName = nm; }
+            if(isExeOut){
+                outExe = abs;
+                outDir = dir;
+            }
+            else {
+                outPkg = abs;
+                outDir = dir;
+            }
+        }
+        else {
+            // 目录（相对路径基于当前工作目录）
+            outDir = normPath(io.fullpath(co));
+        }
+    }
+
+    appName = stripExt(S(appName));
+    if(!#appName){
+        appName = stripExt(baseName(projDir));
+    }
+    if(!#appName){ appName = "app"; }
+
+    if(!outPkg){ outPkg = normPath(outDir ++ "/" ++ appName ++ ".appkg"); }
+    if(!outExe){ outExe = normPath(outDir ++ "/" ++ appName ++ ".exe"); }
+
+    // --- 写保护: 绝不让产物覆盖工具链自身 ---
+    // --out 指到 aac.exe / aardioHost.exe 会直接毁掉整套工具,
+    // 而这类误操作在 CI 里极难回溯（表现只是一个莫名其妙的后续失败）。
+    var selfExe = normPath(io._exepath);
+    if(normPath(outPkg) == selfExe || normPath(outExe) == selfExe){
+        return exitErr("输出路径指向 aac 自身，已拒绝写入: " ++ selfExe);
+    }
+    var hp0 = locateHost();
+    if(hp0 && (normPath(hp0) == normPath(outPkg) || normPath(hp0) == normPath(outExe))){
+        return exitErr("输出路径指向运行时宿主，已拒绝写入（会毁掉工具链）: " ++ hp0);
+    }
+
+    info("应用名称: " ++ appName);
+    info("版本号  : " ++ ver);
+    info("输出目录: " ++ outDir);
+
+    // --- 5. main.aardio ---
+    var mainFull = normPath(projDir ++ "/main.aardio");
+    if(!fileExists(mainFull)){
+        return exitErr("工程缺少入口文件 main.aardio: " ++ mainFull);
+    }
+
+    // --- 6. 收集源文件 ---
+    var excl = {".build"; "dist"; "bin"; "obj"; ".git"; ".svn"; "node_modules"; ".vscode"};
+    var ex = optVal("--exclude");
+    if(ex){
+        var parts = string.split(ex, ",");
+        for(i = 1; #parts; 1){
+            if(#parts[i]){ table.push(excl, parts[i]); }
+        }
+    }
+
+    var srcFiles = {};
+    fsys.enum(projDir, "*.aardio", function(dir, filename, fullpath){
+        if(!filename){ return; }
+        var rel = normPath(fullpath);
+        var prefix = projDir ++ "/";
+        if(#rel > #prefix && string.left(rel, #prefix) == prefix){
+            rel = string.right(rel, #rel - #prefix);
+        }
+        if(aacpkg.isExcluded(rel, excl)){ return; }
+        table.push(srcFiles, {rel = rel; full = normPath(fullpath)});
+    }, true);
+
+    if(#srcFiles == 0){
+        return exitErr("工程目录下未找到任何 .aardio 源文件: " ++ projDir);
+    }
+    sortByRel(srcFiles);
+    info("发现源文件: " ++ #srcFiles ++ " 个");
+
+    // --- 6.5 依赖检查: 工程用到的库是否都在宿主里预埋 ---
+    // 独立 EXE 的库只能来自「宿主发布时被 IDE 嵌入的那一份」。
+    // 缺库的话编译期一切正常, 双击运行才报"找不到库", 是典型的难查故障,
+    // 所以在 build 阶段就算清楚。
+    if(!hasOpt("--no-lib-check")){
+        var hostLibs = null;
+        if(hp0){
+            hostLibs = extractHostLibs(string.load(hp0));
+            if(!hostLibs){
+                warn("无法从宿主读出预埋库清单，已跳过依赖检查（建议重建 aardioHost.exe）");
+            }
+        }
+        if(hostLibs){
+            var need = {};
+            for(i = 1; #srcFiles; 1){
+                var scode = string.load(srcFiles[i].full);
+                if(!scode){ continue; }
+                var imps = scanImports(scode);
+                for(j = 1; #imps; 1){
+                    table.push(need, {lib = imps[j]; from = srcFiles[i].rel});
+                }
+            }
+            var miss = {};
+            for(i = 1; #need; 1){
+                var nm0 = need[i].lib;
+                if(isProjectModule(nm0, srcFiles)){ continue; }
+                if(isOneOf(hostLibs, nm0)){ continue; }
+                // 内核内置命名空间: 任何 aardio EXE 里都有, 报缺就是误报
+                if(isOneOf(KERNEL_NS, nm0)){ continue; }
+                // 相对导入 (import ..xxx / import .xxx): 名字是相对当前命名空间
+                // 解析的, 静态扫描拿不到基准命名空间, 硬判必然误报。
+                // 不拦构建, 但要显式提醒 —— 静默放过才是生产级工具的大忌。
+                if(string.startWith(nm0, ".")){
+                    warn("相对导入无法静态校验，请自行确认运行期可用: "
+                         ++ nm0 ++ "  （被 " ++ need[i].from ++ " 引用）");
+                    continue;
+                }
+                table.push(miss, need[i]);
+            }
+            if(#miss){
+                // ---- --auto-host: 别让用户自己去补库, 直接闭环 ----
+                // 预埋必须经 IDE 发布, 运行时补不了；这一步代为执行
+                // 「改宿主源码 + 重建宿主」，然后重新检查。真实开源工程里
+                // 十有八九会撞上缺库，把它做成一条命令是可用性的分水岭。
+                if(hasOpt("--auto-host")){
+                    var names = {};
+                    for(i = 1; #miss; 1){
+                        if(!isOneOf(names, miss[i].lib)){ table.push(names, miss[i].lib); }
+                    }
+                    var alog = normPath(outDir ++ "/_autohost.log");
+                    var aacExe = normPath(io._exepath);
+                    info("自动补库: " ++ joinText(names, ", "));
+                    info("正在重建宿主（需 IDE 发布一次，约 10~20 秒）...");
+                    var perr = null;
+                    try{
+                        var pr = io.popen("cmd /c " ++ CH_QUOTE ++ aacExe ++ CH_QUOTE
+                                      ++ " host-add " ++ CH_QUOTE ++ joinText(names, ",") ++ CH_QUOTE
+                                      ++ " --rebuild --no-pause --log=" ++ CH_QUOTE ++ alog ++ CH_QUOTE, "r");
+                        // readAll 会一直等到子进程结束 —— 这正是我们要的同步点。
+                        // 读不到输出也没关系, 子进程的诊断都写进 --log 了。
+                        if(pr){
+                            try{ pr.readAll(); } catch(e2){ /* 读不到输出无所谓, 诊断在子进程 --log 里 */ }
+                            try{ pr.close(); }  catch(e3){ /* 同上 */ }
+                        }
+                    }
+                    catch(e){ perr = S(e); }
+                    if(perr){
+                        err("自动补库启动失败: " ++ perr);
+                    }
+                    else {
+                        // 重新读宿主清单（EXE 已被替换）
+                        var hostLibs2 = extractHostLibs(string.load(hp0));
+                        if(hostLibs2){
+                            hostLibs = hostLibs2;
+                            var miss2 = {};
+                            for(i = 1; #miss; 1){
+                                if(!isOneOf(hostLibs2, miss[i].lib)){
+                                    table.push(miss2, miss[i]);
+                                }
+                            }
+                            if(#miss2 == 0){
+                                ok("自动补库完成，宿主已重建，依赖检查通过");
+                                miss = {};
+                            }
+                            else {
+                                warn("自动补库后仍缺 " ++ #miss2 ++ " 个库（多半是重依赖库被拦下，或第三方库）");
+                                miss = miss2;
+                            }
+                        }
+                        else {
+                            warn("重建后读不出宿主预埋清单，无法确认是否补齐");
+                        }
+                    }
+                }
+
+                if(#miss){
+                    for(i = 1; #miss; 1){
+                        err("宿主未预埋库: " ++ miss[i].lib ++ "  （被 " ++ miss[i].from ++ " 引用）");
+                    }
+                    reportMissingLibs(miss);
+                    return exitErr("依赖检查未通过（宿主预埋库缺失）");
+                }
+            }
+            info("依赖检查  : 通过（宿主已预埋全部所需库）");
+        }
+    }
+
+    // --- 7. 注入构建信息（内存中完成, 绝不改动磁盘上的源码）---
+    // 旧实现会把构建信息写回 main.aardio 再做备份/回滚:
+    // 一旦编译失败或进程被中断, 用户源码就带着注入块留在磁盘上,
+    // 下一次构建还会拼出嵌套注释, 语法直接崩。现在只在内存里拼。
+    var mainSrc = string.load(mainFull);
+    if(!mainSrc){
+        return exitErr("无法读取 main.aardio: " ++ mainFull);
+    }
+    mainSrc = stripBuildInfo(mainSrc);
+
+    var headMark = "/*__BUILD_INFO_BEGIN__*/";
+    var endMark  = "/*__BUILD_INFO_END__*/";
+    var infoBlock = headMark
+        ++ `var APP_NAME = "` ++ escStr(appName) ++ `";`
+        ++ `var APP_VERSION = "` ++ escStr(ver) ++ `";`
+        ++ `var BUILD_TIME = "` ++ escStr(time()) ++ `";`
+        ++ endMark;
+    var mainFinal = infoBlock ++ mainSrc;
+
+    // --- 8. 编译 ---
+    info("---- 开始编译 ----");
+
+    // 编译期的当前目录必须是工程目录 —— IDE 发布时就是这么做的。
+    // 否则源码里 `web/import.js` 这类相对包含会按 aac 自己所在目录去解析。
+    // 用户显式给了 --cwd 就以用户为准, 不抢。
+    if(!cwdBase){
+        fsys.setCurDir(projDir);
+    }
+
+    var items = {};
+    var errs = {};
+    var incFixed = 0;
+
+    for(i = 1; #srcFiles; 1){
+        var it = srcFiles[i];
+        var src = string.load(it.full);
+        if(!src){
+            table.push(errs, it.rel ++ "：无法读取（文件为空？）");
+        }
+        else {
+            if(it.rel == "main.aardio"){
+                src = mainFinal;
+            }
+            // $"/res/x" 这类工程根相对包含: IDE 能解析, 独立 EXE 不行,
+            // 这里在内存里补成工程目录下的绝对路径（磁盘源码不动）。
+            var fx = fixIncludeRoots(src, projDir);
+            src = fx;
+            var bc, cerr = compileSource(src);
+            if(!bc){
+                table.push(errs, it.rel ++ "：" ++ S(cerr));
+            }
+            else {
+                table.push(items, {rel = it.rel; code = bc});
+                ok(it.rel ++ " (" ++ #bc ++ " 字节)");
+            }
+        }
+    }
+
+    // 汇总全部错误再退出, 一次暴露所有语法问题而不是遇到第一个就停
+    if(#errs){
+        for(i = 1; #errs; 1){
+            err("编译失败: " ++ errs[i]);
+        }
+        return exitErr("共 " ++ #errs ++ " 个文件编译失败（磁盘源码未被修改）");
+    }
+
+    // --- 9. 打包 ---
+    var meta = {};
+    meta["fmt"]    = aacpkg.FORMAT_VER;
+    meta["kernel"] = aacpkg.kernelStamp();
+    meta["app"]    = appName;
+    meta["ver"]    = ver;
+    meta["time"]   = S(time());
+    var pkgData = aacpkg.pack(items, meta);
+
+    // 产物自检: 写盘前先按宿主的解析路径跑一遍, 确保一定读得出来
+    var chk, chkErr = aacpkg.parse(pkgData);
+    if(!chk){
+        return exitErr("产物自检失败（包无法解析）: " ++ S(chkErr));
+    }
+    if(#chk.files != #items){
+        return exitErr("产物自检失败（文件数不符: " ++ #chk.files ++ " / " ++ #items ++ "）");
+    }
+
+    ensureDir(parentDir(outPkg));
+    if(!string.save(outPkg, pkgData)){
+        return exitErr("包文件写入失败: " ++ outPkg ++ "（目标被占用或无写权限？）");
+    }
+    ok("包文件: " ++ outPkg ++ " (" ++ #pkgData ++ " 字节)");
+
+    // --- 10. 独立 EXE ---
+    var exeMade = null;
+    if(!hasOpt("--no-exe")){
+        var hostPath = locateHost();
+
+        if(hostPath){
+            info("运行时宿主: " ++ hostPath);
+            var hostBin = string.load(hostPath);
+            if(!hostBin){
+                warn("读取宿主失败: " ++ hostPath);
+            }
+            else {
+                ensureDir(parentDir(outExe));
+                var exeBin = hostBin ++ pkgData;
+                if(!string.save(outExe, exeBin)){
+                    err("EXE 写入失败: " ++ outExe);
+                    emit("常见原因: 该 EXE 正在运行被占用，或目标目录无写权限。");
+                    return exitErr("EXE 写入失败（若目标正在运行请先关闭）");
+                }
+                exeMade = outExe;
+                ok("独立EXE: " ++ outExe ++ " (" ++ #exeBin ++ " 字节)");
+            }
+        }
+        else {
+            warn("未找到 aardioHost.exe，只生成了 .appkg");
+            warn("把 aardioHost.exe 放到 aac 同目录即可自动产出独立 EXE");
+        }
+    }
+
+    // --- 11. 报告 ---
+    emit("");
+    emit("==========================================");
+    emit("  构建完成");
+    emit("  应用名称 : " ++ appName);
+    emit("  应用版本 : " ++ ver);
+    emit("  源文件数 : " ++ #srcFiles);
+    emit("  包文件   : " ++ outPkg ++ " (" ++ #pkgData ++ " 字节)");
+    if(exeMade){
+        emit("  独立EXE  : " ++ exeMade);
+    }
+    emit("==========================================");
+    emit("");
+
+    // 给 CI / AI 的可解析结果行
+    ok("BUILD SUCCESS");
+    ok("PKG=" ++ outPkg);
+    if(exeMade){
+        ok("EXE=" ++ exeMade);
+    }
+
+    emit("");
+    if(exeMade){
+        emit("运行方式:");
+        emit("  " ++ exeMade);
+    }
+    else {
+        emit("运行方式:");
+        emit("  aac exec " ++ outPkg ++ " --no-pause");
+    }
+    emit("");
+    emit("注意: 字节码与 aardio 内核版本绑定，升级 aardio 后需重新 build。");
+
+    pauseIfNeed();
+    return 0;
+};
+
+// ============================================================
+//  子命令: compile
+// ============================================================
+
+var cmdCompile = function(){
+    var srcPath = positional[1];
+    var outPath = positional[2];
+
+    if(!srcPath || !outPath){
+        err("用法: aac compile <源文件.aardio> <输出.dump> [--no-pause]");
+        pauseIfNeed();
+        return 1;
+    }
+
+    var srcRaw = srcPath;
+    srcPath = normPath(io.fullpath(srcPath));
+    outPath = normPath(io.fullpath(outPath));
+
+    if(!fileExists(srcPath)){
+        notFoundInput("源文件", srcRaw, srcPath);
+        pauseIfNeed();
+        return 1;
+    }
+
+    var source = string.load(srcPath);
+    if(!source){
+        return exitErr("源文件为空或读取失败: " ++ srcPath);
+    }
+
+    info("正在编译: " ++ srcPath);
+    var bytecode, compErr = compileSource(source);
+    if(!bytecode){
+        return exitErr("编译失败，请检查源码语法（" ++ S(compErr) ++ "）");
+    }
+
+    // 自检: 刚产出的字节码必须能被自己 loadcode 回来
+    var check, cerr = loadcode(bytecode);
+    if(!check){
+        return exitErr("编译产物自检失败: " ++ S(cerr));
+    }
+
+    ensureDir(parentDir(outPath));
+    if(!string.save(outPath, bytecode)){
+        return exitErr("字节码写入失败: " ++ outPath);
+    }
+
+    ok("编译成功: " ++ srcPath ++ " -> " ++ outPath);
+    info("字节码大小: " ++ #bytecode ++ " 字节");
+    info("运行: aac run " ++ outPath ++ " --no-pause");
+
+    pauseIfNeed();
+    return 0;
+};
+
+// ============================================================
+//  子命令: run
+// ============================================================
+
+var cmdRun = function(){
+    var scriptPath = positional[1];
+    if(!scriptPath){
+        err("用法: aac run <脚本.aardio|.dump> [脚本参数...] [--no-pause]");
+        pauseIfNeed();
+        return 1;
+    }
+
+    var scriptRaw = scriptPath;
+    scriptPath = normPath(io.fullpath(scriptPath));
+    if(!fileExists(scriptPath)){
+        notFoundInput("脚本文件", scriptRaw, scriptPath);
+        pauseIfNeed();
+        return 1;
+    }
+
+    var code = string.load(scriptPath);
+    if(!code){
+        return exitErr("文件为空或读取失败: " ++ scriptPath);
+    }
+
+    // loadcode 既能加载源码，也能加载 dumpcode 产出的字节码
+    var func, lerr = loadcode(code);
+    if(!func){
+        err("编译失败: " ++ scriptPath);
+        err(S(lerr));
+        if(string.find(S(lerr), "bad code")){
+            err("原因: 字节码由旧版本 aardio 编译，与当前内核不匹配，请重新编译。");
+        }
+        pauseIfNeed();
+        return 1;
+    }
+
+    var runArgs = scriptArgs();
+    // _ARGV 是内核常量不可改, 用全局 APP_ARGS 把干净参数交给脚本
+    APP_ARGS = runArgs;
+
+    info("正在运行: " ++ scriptPath);
+    var ret = null;
+    var runErr = null;
+    try{
+        ret = func(table.unpack(runArgs));
+        if(ret != null){
+            info("脚本返回: " ++ S(ret));
+        }
+    }
+    catch(e){
+        runErr = S(e);
+    }
+    // 【坑】不能把 return exitErr(...) 写在 catch 里 —— aardio 的 try/catch
+    // 内部 return 不生效，错误会被吞掉，崩溃的脚本照样返回退出码 0，
+    // CI 里就成了「失败被判成功」。
+    if(runErr){
+        return exitErr("运行时错误: " ++ runErr);
+    }
+
+    // 脚本的 return 值就是进程退出码, 这样 aac run 才能用于 CI 判定
+    pauseIfNeed();
+    return toExitCode(ret);
+};
+
+// ============================================================
+//  子命令: exec —— 执行 .appkg
+// ============================================================
+
+var preparePkg = function(pkgPath){
+    var pkgRaw = pkgPath;
+    pkgPath = normPath(io.fullpath(pkgPath));
+    if(!fileExists(pkgPath)){
+        notFoundInput("包文件", pkgRaw, pkgPath);
+        return null, null, "包文件不存在";
+    }
+    var bin = string.load(pkgPath);
+    if(!bin){
+        return null, null, "包文件读取失败: " ++ pkgPath;
+    }
+    var pkg, perr = aacpkg.parse(bin);
+    if(!pkg){
+        return null, null, "包解析失败: " ++ S(perr);
+    }
+    return pkg, pkgPath, null;
+};
+
+// 建立 PKG 表与 loadModule，供载荷内的 main.aardio 加载工程内模块
+var installPkg = function(pkg){
+    PKG = {};
+    for(i = 1; #pkg.files; 1){
+        PKG[pkg.files[i].rel] = pkg.files[i].code;
+    }
+    loadModule = function(relPath){
+        relPath = string.replace(S(relPath), CH_BACKSLASH, "/");
+        var code = PKG[relPath];
+        if(!code){
+            return null, "模块不存在: " ++ relPath;
+        }
+        var f, e = loadcode(code);
+        if(!f){
+            return null, S(e);
+        }
+        return f;
+    };
+};
+
+var cmdExec = function(){
+    var pkgPath = positional[1];
+    if(!pkgPath){
+        err("用法: aac exec <包文件.appkg> [脚本参数...] [--no-pause]");
+        pauseIfNeed();
+        return 1;
+    }
+
+    var pkg, real, perr = preparePkg(pkgPath);
+    if(!pkg){
+        return exitErr(perr);
+    }
+
+    // 内核指纹不一致时提前告警, 而不是等 loadcode 抛 "bad code"
+    var kstamp = pkg.meta["kernel"];
+    if(kstamp && kstamp != aacpkg.kernelStamp()){
+        warn("包由不同版本 aardio 内核编译（包内 " ++ S(kstamp) ++ " / 本机 " ++ aacpkg.kernelStamp() ++ "），可能无法运行");
+    }
+
+    info("包已加载: " ++ S(real));
+    info("包含文件: " ++ #pkg.files ++ " 个");
+
+    installPkg(pkg);
+
+    var mainCode = PKG["main.aardio"];
+    if(!mainCode){
+        return exitErr("包内缺少 main.aardio 入口文件");
+    }
+
+    var func, lerr = loadcode(mainCode);
+    if(!func){
+        err("main.aardio 字节码加载失败: " ++ S(lerr));
+        if(string.find(S(lerr), "bad code")){
+            err("原因: 包由旧版本 aardio 编译，与当前内核不匹配，请重新 build。");
+        }
+        pauseIfNeed();
+        return 1;
+    }
+
+    var pkgArgs = scriptArgs();
+    APP_ARGS = pkgArgs;
+
+    info("正在执行 main.aardio ...");
+    emit("------------------------------------------");
+    var pret = null;
+    var execErr = null;
+    try{
+        pret = func(table.unpack(pkgArgs));
+    }
+    catch(e){
+        execErr = S(e);
+    }
+    emit("------------------------------------------");
+    if(execErr){
+        return exitErr("运行时错误: " ++ execErr);
+    }
+
+    if(pret != null){
+        info("脚本返回: " ++ S(pret));
+    }
+
+    pauseIfNeed();
+    return toExitCode(pret);
+};
+
+// ============================================================
+//  子命令: info —— 打印包元信息（排错用）
+// ============================================================
+
+var cmdInfo = function(){
+    var pkgPath = positional[1];
+    if(!pkgPath){
+        err("用法: aac info <包文件.appkg|独立EXE> [--no-pause]");
+        pauseIfNeed();
+        return 1;
+    }
+
+    var pkg, real, perr = preparePkg(pkgPath);
+    if(!pkg){
+        return exitErr(perr);
+    }
+
+    emit("文件    : " ++ S(real));
+    emit("格式版本: " ++ S(pkg.meta["fmt"]));
+    emit("应用名  : " ++ S(pkg.meta["app"]));
+    emit("版本    : " ++ S(pkg.meta["ver"]));
+    emit("构建时间: " ++ S(pkg.meta["time"]));
+    emit("内核指纹: " ++ S(pkg.meta["kernel"]) ++ "（本机 " ++ aacpkg.kernelStamp() ++ "）");
+    emit("CRC     : " ++ S(pkg.meta["crc"]) ++ "（校验通过）");
+    emit("字节码  : " ++ #pkg.blobs ++ " 字节");
+    emit("");
+    emit("文件清单:");
+    for(i = 1; #pkg.files; 1){
+        emit("  " ++ pkg.files[i].rel ++ "  (" ++ pkg.files[i].len ++ " 字节)");
+    }
+
+    if(pkg.meta["kernel"] && pkg.meta["kernel"] != aacpkg.kernelStamp()){
+        warn("内核指纹与本机不一致，该包可能无法在本机运行");
+    }
+
+    pauseIfNeed();
+    return 0;
+};
+
+// ============================================================
+//  子命令: libs —— 查看宿主预埋了哪些标准库
+// ============================================================
+
+var cmdLibs = function(){
+    var hp = locateHost();
+    if(!hp){
+        warn("未找到 aardioHost.exe，无法查询预埋库清单");
+        warn("把 aardioHost.exe 放到 aac 同目录，或用 --host=路径 指定");
+        return 1;
+    }
+    var libs = extractHostLibs(string.load(hp));
+    if(!libs){
+        err("无法从宿主读出预埋库清单: " ++ hp);
+        err("该宿主版本过旧，请执行 build.py 重新发布");
+        return 1;
+    }
+    // 是否显示全部（默认按前缀分组精简）
+    emit("宿主    : " ++ hp);
+    emit("预埋库  : " ++ #libs ++ " 个");
+    emit("");
+    for(i = 1; #libs; 1){
+        emit("  " ++ libs[i]);
+    }
+    emit("");
+    emit("工程用到清单外的库时，不必手工改源码 —— 直接执行：");
+    emit("    aac host-add <库名>[,<库名>...]");
+    emit("会自动写入 aardioHost.aardio 并重建宿主。");
+    return 0;
+};
+
+// ============================================================
+//  子命令: host-add —— 自动给宿主补库
+// ============================================================
+// 以前缺库要三步手工操作: 改 aardioHost.aardio 的 import 列表 ->
+// 同步 HOST_LIBS_DECL -> 跑 build.py 重新发布。每一步都容易出错,
+// 而且「改漏 HOST_LIBS_DECL」这种失误编译期毫无症状, 运行时才崩。
+// 这里把它们合成一条命令。
+//
+// 关于「库是不是要下载」:
+//   aardio 的标准库随安装一次性装全（本机 lib 目录有 900+ 个模块文件）,
+//   缺库并不需要联网下载 —— 缺的只是「被嵌进宿主 EXE」这一步。
+//   只有第三方库才需要用 IDE 的「库管理器」安装, 本命令会明确区分。
+
+// ---- 重建宿主 + 验证（host-add / host-del 共用）----
+// 【踩过的坑】早期版本用 io.popen 跑 build.py，拿不到输出就直接 return 0。
+// 结果是宿主根本没重建，命令却报成功；用户再跑一次 aac build 还是同样的
+// 缺库，而且完全不知道该怀疑谁 —— 这正是「谎报成功」最伤人的形态。
+//
+// 所以退出码不取自子进程的返回值，而取自**事实**：重建之后再去读宿主 EXE
+// 里的 __HOST_LIBS__ 哨兵，看这些库到底在不在里面。
+var rebuildHost = function(rootDir, outHost, want){
+    var Q = string.char(34);
+    var buildPy = normPath(rootDir ++ "/build.py");
+    if(!fileExists(buildPy)){
+        err("找不到 build.py: " ++ buildPy);
+        emit("  请手动执行: python build.py aardioHost-runner --out <宿主EXE路径>");
+        return 1;
+    }
+    if(!outHost){ outHost = locateHost(); }
+    if(!outHost){ outHost = normPath(io.joinpath(rootDir, "aardioHost.exe")); }
+
+    var rbLog = normPath(rootDir ++ "/_rebuild_host.log");
+    if(fileExists(rbLog)){ fsys.delete(rbLog); }
+
+    emit("");
+    emit("正在重建宿主（会短暂弹出 aardio IDE 窗口，脚本结束前会自动关闭）...");
+    // 注意: 三个标准句柄必须全部重定向掉。
+    // 只写 `> log 2>&1` 是不够的 —— python 启动时若 stdin 还是个管道/控制台句柄,
+    // 会直接崩在 init_sys_streams:
+    //     Fatal Python error: init_sys_streams: can't initialize sys standard streams
+    //     ValueError: Cannot open console output buffer for reading
+    // 表现为「宿主没重建但命令不报错」，排查成本极高。补一个 `< nul` 即可。
+    // 不用 `cd /d X && python build.py`: 在 io.popen 起的 cmd 里 cd 有时不生效
+    // （实测 python 报错 "can't open file '%AARDIO_HOME%\build.py'"，
+    //  即根本没切过去）。直接给 build.py 绝对路径最稳，build.py 内部
+    // 全部按 __file__ 定位，不依赖当前目录。
+    // 命令**不能以引号开头**: cmd /c 见到开头是引号会走它自己的去引号规则,
+    // 把整条命令切得面目全非（实测报 `'python" "D:' 不是内部或外部命令）。
+    // 所以 python 这个词裸着写, 只有路径加引号。
+    var cmdLine = "python"
+                ++ " " ++ Q ++ buildPy ++ Q
+                ++ " aardioHost-runner --out " ++ Q ++ outHost ++ Q
+                ++ " > " ++ Q ++ rbLog ++ Q ++ " 2>&1 < nul";
+    var pr = io.popen("cmd /c " ++ cmdLine, "r");
+    if(pr){ pr.read(-1); pr.close(); }
+
+    var po = string.load(rbLog) or "";
+    if(#po){
+        emit("---- build.py 输出（末尾 14 行）----");
+        var lines = string.split(po, CH_LF);
+        var st = 1;
+        if(#lines > 14){ st = #lines - 13; }
+        for(i = st; #lines; 1){ emit("  " ++ lines[i]); }
+        emit("------------------------------------");
+    }
+    else {
+        warn("build.py 没有任何输出（多半是命令行里找不到 python）");
+    }
+
+    // 事实校验: 读哨兵
+    var hp2 = locateHost();
+    var after = {};
+    if(hp2){ after = extractHostLibs(string.load(hp2)) or {}; }
+    var still = {};
+    for(i = 1; #want; 1){
+        if(!isOneOf(after, want[i])){ table.push(still, want[i]); }
+    }
+    if(#still){
+        err("重建后宿主里仍然没有: " ++ joinText(still, ", "));
+        err("  上面那条重建命令没有真正成功（常见原因: 命令行找不到 python、IDE 发布被中断）");
+        emit("  请手动执行后重试:");
+        emit("    python build.py aardioHost-runner --out " ++ outHost);
+        return 1;
+    }
+    if(#want){
+        ok("宿主已重建，新库已在预埋清单里（共 " ++ #after ++ " 个）");
+    }
+    else {
+        ok("宿主已重建（预埋库 " ++ #after ++ " 个）");
+    }
+    return 0;
+};
+
+// ============================================================
+//  宿主源码 import 区块: 解析 + 去重
+// ============================================================
+// 为什么 host-add 不能只信「宿主 EXE 里的哨兵」:
+//   预埋是在 IDE 发布那一刻才写进 EXE 的。只要上一次 rebuild 没真成功
+//   （python 找不到 / IDE 发布被中断 / 宿主被回滚），哨兵里就没有刚加过的库，
+//   于是同一个库会被反复追加进源码 —— 实测 string.cmdline 被加了 5 次。
+//   「下一次发布会预埋什么」的唯一真相是源码本身，哨兵只能当参考。
+//
+// 为什么去重要按「整行 + 前一个换行」精修而不是全文重写:
+//   全文 split/join 会顺手改掉换行符和文件末尾换行（host-del 早期版本就踩过），
+//   而生态环境里 diff 出来的噪音会让"这次到底改了什么"变得看不清。
+// 库名字符集必须与 build.py 的 import 提取正则严格对齐: [A-Za-z_][\w.]*
+var isLibName = function(s){
+    if(!s or #s == 0){ return false; }
+    var c0 = aacpkg.mid(s, 1, 1);
+    var letter = (c0 >= "a" and c0 <= "z") or (c0 >= "A" and c0 <= "Z") or (c0 == "_");
+    if(not letter){ return false; }
+    for(k = 2; #s; 1){
+        var c = aacpkg.mid(s, k, 1);
+        var good = (c >= "a" and c <= "z")
+                or (c >= "A" and c <= "Z")
+                or (c >= "0" and c <= "9")
+                or (c == "_") or (c == ".");
+        if(not good){ return false; }
+    }
+    return true;
+};
+
+var hostScanImports = function(src){
+    // 每条 = { 库名; 删除起点; 删除终点 }（起点含换行、终点含换行，整段切掉不留空行）
+    var hits = {};
+    var pos = 1;
+    var prevNl = 0;
+    while(pos <= #src){
+        var nl = string.indexOf(src, CH_LF, pos);
+        var lnl = nl ? nl : 0;                       // 0 = 本行没有换行符（文件末尾）
+        var lineEnd = lnl ? (lnl - 1) : #src;
+        var next = lnl ? (lnl + 1) : (#src + 1);
+        if(lineEnd >= pos){
+            var line = string.trim(aacpkg.mid(src, pos, lineEnd - pos + 1), WS);
+            // 只认顶层 import; CRLF 的行尾 '\r' 已被 trim 吃掉
+            if(string.startWith(line, "import ")){
+                // 【必须与 build.py 同语义】名字取到第一个 ';' 为止, 分号后面
+                // 还有东西也算数 —— `import x; // 说明` 是极常见的写法。
+                // 早期版本要求整行以 ';' 结尾才算 import, 于是出现分歧:
+                //   build.py  : 认这是 x 的 import, 纳入清单, 发布通过
+                //   aac 侧     : 看不见它 → host-add x 再追加一条
+                //   → 于是源码里两条 → check_host_libs 报「重复 import」
+                //   → 而它给出的修复命令恰恰就是制造重复的那条命令, 死循环。
+                var sc = string.indexOf(line, ";", 8);
+                if(sc){
+                    var nm = stripSpace(aacpkg.mid(line, 8, sc - 8));
+                    if(isLibName(nm)){
+                        table.push(hits, {nm; (prevNl + 1); (lnl ? lnl : #src)});
+                    }
+                }
+            }
+        }
+        prevNl = lnl;
+        pos = next;
+    }
+    return hits;
+};
+
+var hostSourceImports = function(src){
+    var names = {};
+    var hits = hostScanImports(src);
+    for(i = 1; #hits; 1){
+        if(!isOneOf(names, hits[i][1])){ table.push(names, hits[i][1]); }
+    }
+    return names;
+};
+
+// 同一条 import 出现多次时，保留第一次，其余整段切掉
+var hostDedupeImports = function(src){
+    var seen = {};
+    var cutA = {};
+    var cutB = {};
+    var dups = {};
+    var hits = hostScanImports(src);
+    for(i = 1; #hits; 1){
+        var nm = hits[i][1];
+        if(isOneOf(seen, nm)){
+            table.push(dups, nm);
+            table.push(cutA, hits[i][2]);
+            table.push(cutB, hits[i][3]);
+        }
+        else {
+            table.push(seen, nm);
+        }
+    }
+    // 从后往前删，前面的下标才不会失效
+    for(i = #cutA; 1; -1){
+        var a = cutA[i];
+        var b = cutB[i];
+        src = aacpkg.mid(src, 1, a - 1) ++ string.right(src, #src - b);
+    }
+    return src, dups;
+};
+
+// 哨兵清单必须与 import 区块严格同集合。与其往旧串后面手工追加
+// （漏一条就漂移，多追一次就重复），不如每次按去重后的 import 列表整体重写。
+var hostSyncSentinel = function(src){
+    var s1 = string.indexOf(src, "__HOST_LIBS__*/");
+    if(!s1){ return null, "宿主源码里没有 __HOST_LIBS__ 哨兵"; }
+    var s2 = string.indexOf(src, "/*__HOST_LIBS_END__");
+    if(!s2 || s2 < s1){ return null, "宿主源码里没有 __HOST_LIBS_END__ 哨兵"; }
+    var begin = s1 + 15;
+    var names = hostSourceImports(src);
+    return aacpkg.mid(src, 1, begin - 1)
+           ++ joinText(names, ",")
+           ++ string.right(src, #src - (s2 - 1)), null;
+};
+
+var cmdHostAdd = function(){
+    // --cwd 已在启动时处理, 这里不需要再管相对路径
+    var todo = {};
+    for(i = 1; #positional; 1){
+        var one = string.split(positional[i], ",;");
+        for(j = 1; #one; 1){
+            var nm = stripSpace(one[j]);
+            if(#nm){ table.push(todo, nm); }
+        }
+    }
+    if(#todo == 0){
+        err("请给出要补的库名，例如: aac host-add string.uuid,zlib.zip");
+        emit("不知道确切名字？先用 aac libs 看看已有哪些，或让缺库报告直接给你命令。");
+        pauseIfNeed();
+        return 1;
+    }
+
+    var hostSrc = findFileUpwards("aardioHost.aardio");
+    if(!hostSrc){
+        return exitErr("找不到 aardioHost.aardio 源码，无法自动补库。" ++ "（请在 AardioCompile 工程目录或其任意子目录执行）");
+    }
+    hostSrc = normPath(io.fullpath(hostSrc));
+    var src = string.load(hostSrc);
+    if(!src){
+        return exitErr("无法读取: " ++ hostSrc);
+    }
+
+    // 宿主 EXE 里的哨兵清单 —— 只做【诊断】，绝不参与下面的判定。
+    //
+    // 【为什么不能拿它判"已预埋"】它是上一次【成功发布】的产物快照,
+    // 而 host-del 只改源码、EXE 要等 --rebuild 才更新, 中间那段窗口里
+    // 哨兵必然比源码"多"。若用它跳过:
+    //     host-del gamma → host-add gamma → 「已预埋，跳过」，什么都没做
+    //   → 下一次发布真的没有 gamma → 用户补库 → 还是「已预埋」→ 死循环。
+    // 因此"下次发布会预埋什么"只认源码 import 区块（见下）。
+    var declared = {};
+    var hp1 = locateHost();
+    if(hp1){
+        declared = extractHostLibs(string.load(hp1)) or {};
+    }
+
+    // 历史遗留的重复项顺手清掉: 同一条 import 出现多次没有语义差别，
+    // 但会让 aac libs 报重复、让哨兵失去"清单"的意义。
+    // 实测 string.cmdline 因为早期 rebuild 静默失败被追加了 5 次。
+    var dupNames = {};
+    src, dupNames = hostDedupeImports(src);
+    if(#dupNames){
+        warn("源码里有重复的 import，已自动清理: " ++ joinText(dupNames, ", "));
+    }
+
+    // 源码里已有的 import —— 这才是"下次发布会预埋什么"的**唯一**真相。
+    // 哨兵只反映"上一次发布成功写进去了什么"，两者不一致时（发布失败/回滚/
+    // 刚 host-del 完还没重建）必须以源码为准 —— 详见上面 declared 的注释。
+    var inSource = hostSourceImports(src);
+
+    // 哨兵比源码「多」出来的库: 说明这两个口令不同步（典型是刚 host-del 完
+    // 还没 --rebuild）。明确报出来，别让用户对着「到底算预埋了没有」猜。
+    var staleSentinel = {};
+
+    var avail = scanAvailableLibs();
+    var added   = {};
+    var skipped = {};
+    var unknown = {};
+    var risky   = {};
+    for(i = 1; #todo; 1){
+        var lib = todo[i];
+        // 注意: 这里【不能】再拿 declared（EXE 哨兵）判"已预埋" —— 见上面的注释
+        if(isOneOf(added, lib) or isOneOf(inSource, lib)){
+            table.push(skipped, lib);
+        }
+        elseif(isOneOf(avail, lib)){
+            if(isOneOf(declared, lib)){ table.push(staleSentinel, lib); }
+            if(isOneOf(HOST_FATAL_LIBS, lib) && !hasOpt("--force")){
+                table.push(risky, lib ++ "（实测会让产物起不来，见 HOST_FATAL_LIBS）");
+            }
+            else {
+                // 重副作用库会拖垮每一个由宿主打出的 EXE, 默认拒绝, 见 RISKY_IMPORTS
+                var badDep = libRiskyImports(lib);
+                if(badDep && !hasOpt("--force")){
+                    table.push(risky, lib ++ "（会 import " ++ badDep ++ "）");
+                }
+                else {
+                    // 改写 loadcode / string 等全局名的库同样致命, 见 HOST_CRITICAL_GLOBALS
+                    var ov = libOverridesGlobals(lib);
+                    if(ov && !hasOpt("--force")){
+                        table.push(risky, lib ++ "（顶层改写了 " ++ joinText(ov, "/") ++ "）");
+                    }
+                    else {
+                        table.push(added, lib);
+                    }
+                }
+            }
+        }
+        else {
+            table.push(unknown, lib);
+        }
+    }
+
+    if(#risky){
+        warn("以下库会在 import 时拉起重依赖，预埋后每个用宿主打出的 EXE 都可能卡死在启动阶段，已跳过:");
+        for(i = 1; #risky; 1){
+            emit("    " ++ risky[i]);
+        }
+        emit("  确实需要请加 --force，并务必重建后立刻冒烟验证一个最小 EXE。");
+    }
+
+    if(#unknown){
+        for(i = 1; #unknown; 1){
+            err("aardio 标准库里没有这个库: " ++ unknown[i]);
+            var sug = suggestFrom(avail, unknown[i]);
+            if(#sug){
+                emit("  你是不是想输入: " ++ joinText(sug, ", "));
+            }
+            else {
+                emit("  这不是 aardio 自带库。若是第三方库，请先用 aardio IDE 的「库管理器」安装，");
+                emit("  安装成功后再执行本命令（安装后它就会出现在标准库目录里）。");
+            }
+        }
+    }
+    // 这条提示是整个 bug 的可见出口：以前它表现为「已预埋，跳过」+ 什么都不做，
+    // 用户只知道补不上，不知道为什么。
+    if(#staleSentinel){
+        warn("这些库在【宿主 EXE 的哨兵清单】里有、但源码里没有 " ++ joinText(staleSentinel, ", "));
+        emit("  说明两者没同步（典型情况：刚执行过 host-del 还没 --rebuild）。");
+        emit("  判定一律以源码为准，本次会当作新库补上；重新发布后两者即恢复一致。");
+    }
+
+    if(#skipped){
+        info("宿主源码已预埋，跳过: " ++ joinText(skipped, ", "));
+    }
+    if(#added == 0){
+        // 没有新库，但可能刚清理了重复项 —— 那也必须落盘，否则等于白清
+        if(#dupNames){
+            var nsD, sErrD = hostSyncSentinel(src);
+            if(!nsD){ return exitErr(sErrD); }
+            if(!string.save(hostSrc, nsD)){
+                return exitErr("宿主源码写入失败: " ++ hostSrc);
+            }
+            ok("已整理宿主源码: " ++ hostSrc);
+            if(hasOpt("--rebuild")){
+                var rdir5 = normPath(io.splitpath(hostSrc).dir);
+                var rc5 = rebuildHost(rdir5, hp1, {});
+                pauseIfNeed();
+                return rc5;
+            }
+            emit("");
+            emit("预埋清单还要重新发布一次宿主才会生效:");
+            emit("    python build.py aardioHost-runner --out <宿主EXE路径>");
+            pauseIfNeed();
+            return 0;
+        }
+        // 显式给了 --rebuild 就照样重建: 用户要的是"重新发布一次宿主",
+        // 哪怕没有新库（例如刚手工改过 aardioHost.aardio）。
+        // 以前这里直接 rc=1 早退, 让 --rebuild 在这种场景下形同虚设。
+        if(hasOpt("--rebuild")){
+            var rdir = normPath(io.splitpath(hostSrc).dir);
+            var rc4 = rebuildHost(rdir, hp1, {});
+            pauseIfNeed();
+            return rc4;
+        }
+        // 全部都已预埋、且没有任何一个被拒绝/找不到: 这是幂等的空操作,
+        // 不该算失败。CI 里执行两遍就 rc=1 会打断流水线，
+        // 而"已预埋"恰恰是这个命令要达到的状态。
+        if(#skipped and #risky == 0 and #unknown == 0){
+            ok("全部已预埋，无事可做: " ++ joinText(skipped, ", "));
+            pauseIfNeed();
+            return 0;
+        }
+        return exitErr("没有需要新增的库");
+    }
+
+    // ---- 写入源码: 插到最后一个 import 语句之后 ----
+    var insPos = 0;
+    var pos = 0;
+    while(true){
+        var p = string.indexOf(src, CH_LF ++ "import ", (pos + 1) or 1);
+        if(!p){ break; }
+        insPos = p;
+        pos = p;
+    }
+    if(insPos == 0){
+        // 源码可能被格式化成行首就是 import（文件开头）
+        if(string.startWith(src, "import ")){ insPos = 1; }
+    }
+    if(insPos == 0){
+        return exitErr("在 aardioHost.aardio 里没找到 import 区块，无法自动插入");
+    }
+
+    var eol = string.indexOf(src, ";", insPos);
+    if(!eol){
+        return exitErr("最后一个 import 语句没有分号结尾，无法自动插入");
+    }
+    var head = string.left(src, eol);
+    var tail = string.right(src, #src - eol);
+    var blocktxt = "";
+    for(i = 1; #added; 1){
+        blocktxt = blocktxt ++ CRLF ++ "import " ++ added[i] ++ ";";
+    }
+    var newSrc = head ++ blocktxt ++ tail;
+
+    // ---- 同步 HOST_LIBS_DECL 哨兵 ----
+    // 整体按去重后的 import 列表重写，而不是往旧串尾部追加:
+    // 追加会在每次 rebuild 失败后再补一次重复的库名。
+    var newSrc2, sErr = hostSyncSentinel(newSrc);
+    if(!newSrc2){ return exitErr(sErr); }
+    newSrc = newSrc2;
+
+    if(!string.save(hostSrc, newSrc)){
+        return exitErr("宿主源码写入失败: " ++ hostSrc);
+    }
+    ok("已更新宿主源码: " ++ hostSrc);
+    info("新增库: " ++ joinText(added, ", "));
+
+    // ---- 自动重建宿主 ----
+    // 预埋是在「IDE 发布」这一刻完成的, 运行时不可能凭空追加,
+    // 所以必须再由 IDE 过一遍。--rebuild 就是把这一步也包了。
+    if(hasOpt("--rebuild")){
+        var rootDir = normPath(io.splitpath(hostSrc).dir);
+        var rc2 = rebuildHost(rootDir, hp1, added);
+        pauseIfNeed();
+        return rc2;
+    }
+
+    emit("");
+    emit("下一步（预埋必须经 IDE 发布一次，无法在运行时追加）:");
+    emit("    python build.py aardioHost-runner --out <宿主EXE路径>");
+    emit("或者直接用一条命令做完: aac host-add " ++ joinText(todo, ",") ++ " --rebuild");
+    emit("");
+    emit("说明: 标准库已随 aardio 安装在本机，不需要下载；");
+    emit("      只是要重新生成一个把它们嵌进去的宿主。");
+    pauseIfNeed();
+    return 0;
+};
+
+// ============================================================
+//  aac host-del —— 从宿主里剔除库
+// ============================================================
+// 为什么必须有它:
+// 预埋是「一次写进 EXE」的, 加错了不能靠下次覆盖修正, 只能删掉重建。
+// 手工编辑 aardioHost.aardio 很容易只删 import 忘删哨兵清单(或反之),
+// 两边漂移后就是"看起来预埋了其实没有"。所以让命令同时改这两处。
+var cmdHostDel = function(){
+    var todo = {};
+    for(i = 1; #positional; 1){
+        var one = string.split(positional[i], ",;");
+        for(j = 1; #one; 1){
+            var nm = stripSpace(one[j]);
+            if(#nm){ table.push(todo, nm); }
+        }
+    }
+    if(#todo == 0){
+        err("请给出要剔除的库名，例如: aac host-del java.jre.v8,inet.file");
+        pauseIfNeed();
+        return 1;
+    }
+
+    var hostSrc = findFileUpwards("aardioHost.aardio");
+    if(!hostSrc){
+        return exitErr("找不到 aardioHost.aardio 源码（请在 AardioCompile 工程目录或其子目录执行）");
+    }
+    hostSrc = normPath(io.fullpath(hostSrc));
+    var src = string.load(hostSrc);
+    if(!src){ return exitErr("无法读取: " ++ hostSrc); }
+
+    var s1 = string.indexOf(src, "__HOST_LIBS__*/");
+    var s2 = string.indexOf(src, "/*__HOST_LIBS_END__");
+    if(!s1 || !s2 || s2 < s1){
+        return exitErr("宿主源码里没有完整的 __HOST_LIBS__ 哨兵，无法安全修改");
+    }
+    var begin = s1 + 15;
+    var oldList = aacpkg.mid(src, begin, s2 - begin);
+
+    var declared = string.split(oldList, ",");
+    var removed = {};
+    var absent  = {};
+    var newSrc = src;
+    var endsNl = (string.right(src, 1) == CH_LF);
+    for(i = 1; #todo; 1){
+        var lib = todo[i];
+        if(!isOneOf(declared, lib)){
+            table.push(absent, lib);
+        }
+        else {
+            // 逐行比对, 只删整行的 `import lib;`, 避免误伤 import lib.sub
+            var out = {};
+            var pos = 1;
+            while(true){
+                var nl = string.indexOf(newSrc, CH_LF, pos);
+                var line = null;
+                if(nl){
+                    line = aacpkg.mid(newSrc, pos, nl - pos);
+                    pos = nl + 1;
+                }
+                else {
+                    line = string.right(newSrc, #newSrc - (pos - 1));
+                    pos = #newSrc + 1;
+                }
+                var tl = string.trim(line, WS);
+                // 与 hostScanImports / build.py 同语义: 名字取到第一个 ';'
+                // 为止。写成 tl == "import x;" 的话, `import x; // 说明`
+                // 这种行永远匹配不上, 表现为"删了却还在"。
+                var dlib = null;
+                if(string.startWith(tl, "import ")){
+                    var sc = string.indexOf(tl, ";", 8);
+                    if(sc){ dlib = stripSpace(aacpkg.mid(tl, 8, sc - 8)); }
+                }
+                if(dlib and dlib == lib){
+                    table.push(removed, lib);
+                }
+                else {
+                    table.push(out, line);
+                }
+                if(pos > #newSrc){ break; }
+            }
+                // 按行重建会把文件末尾那个换行弄丢（每行保留了各自的 '\r'，
+                // CRLF 不会退化成 LF），这里补回去，避免每次 host-del 都多一行 diff 噪音
+                newSrc = joinText(out, CH_LF) ++ (endsNl ? CH_LF : "");
+            }
+    }
+
+    if(#absent and #removed){
+        info("有一部分本来就没有，跳过: " ++ joinText(absent, ", "));
+    }
+    if(#removed == 0){
+        // 删一个本来就不存在的库是幂等空操作，不该算失败（同 host-add）
+        if(#absent){
+            ok("宿主本来就没有，无事可做: " ++ joinText(absent, ", "));
+            pauseIfNeed();
+            return 0;
+        }
+        return exitErr("没有需要剔除的库");
+    }
+
+    // 同步哨兵清单: 按剩下的 import 整体重写（顺带把历史重复项一起清掉）
+    var newSrc3, sErr3 = hostSyncSentinel(newSrc);
+    if(!newSrc3){ return exitErr(sErr3); }
+    newSrc = newSrc3;
+
+    if(!string.save(hostSrc, newSrc)){
+        return exitErr("宿主源码写入失败: " ++ hostSrc);
+    }
+    ok("已从宿主源码剔除: " ++ joinText(removed, ", "));
+    info("剩余预埋库: " ++ #hostSourceImports(newSrc) ++ " 个");
+
+    if(hasOpt("--rebuild")){
+        var rootDir = normPath(io.splitpath(hostSrc).dir);
+        var rc3 = rebuildHost(rootDir, null, {});
+        pauseIfNeed();
+        return rc3;
+    }
+    emit("");
+    emit("下一步: python build.py aardioHost-runner --out <宿主EXE路径>");
+    pauseIfNeed();
+    return 0;
+};
+
+
+
+// ============================================================
+//  主入口
+// ============================================================
+
+var dispatch = function(){
+    // 未知参数先于一切业务处理拦掉
+    if(!checkArgs()){ return 1; }
+
+    if(!cmd || cmd == ""){
+        showHelp();
+        pauseIfNeed();
+        return 1;
+    }
+
+    if(cmd == "build"){        return cmdBuild(); }
+    elseif(cmd == "compile"){  return cmdCompile(); }
+    elseif(cmd == "run"){      return cmdRun(); }
+    elseif(cmd == "exec"){     return cmdExec(); }
+    elseif(cmd == "info"){     return cmdInfo(); }
+    elseif(cmd == "libs"){     return cmdLibs(); }
+    elseif(cmd == "host-add"){ return cmdHostAdd(); }
+    elseif(cmd == "host-del"){ return cmdHostDel(); }
+    elseif(cmd == "version" || cmd == "--version" || cmd == "-V"){
+        showVersion();
+        pauseIfNeed();
+        return 0;
+    }
+    elseif(cmd == "help" || cmd == "--help" || cmd == "-h"){
+        showHelp();
+        pauseIfNeed();
+        return 0;
+    }
+
+    err("未知子命令: " ++ cmd);
+    emit("");
+    showHelp();
+    pauseIfNeed();
+    return 1;
+};
+
+// 统一兜底: 任何未捕获异常都要能落到 --log 里, 否则调用方只能看到退出码 -1。
+// 【坑】return 写在 try/catch 里不生效，必须先把结果落到变量再在块外处理。
+var rc = 0;
+try{
+    rc = dispatch();
+    if(!rc){ rc = 0; }
+}
+catch(e){
+    err("未捕获异常: " ++ S(e));
+    pauseIfNeed();
+    rc = 1;
+}
+hardExit(rc);
+return rc;

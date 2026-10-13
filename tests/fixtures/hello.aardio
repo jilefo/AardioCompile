@@ -1,0 +1,2 @@
+import console;
+console.log("HELLO_FROM_COMPILE");

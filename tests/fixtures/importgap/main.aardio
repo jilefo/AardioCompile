@@ -1,0 +1,4 @@
+import console;
+// 中间夹一行注释
+import gdip.brush;
+console.log("x");

@@ -1,0 +1,70 @@
+// ================================================================
+//  test —— aac 示例工程
+// ================================================================
+//  覆盖点: 构建信息注入 / 子模块加载 / 命令行参数 / 退出码
+//  构建:   aac build test --out=dist\test.exe
+//  运行:   dist\test.exe --no-pause
+// ================================================================
+
+import console;
+
+// APP_NAME / APP_VERSION / BUILD_TIME 由 aac 在编译期注入到源码最前面。
+// 直接用 IDE 运行时没有注入, 这里兜底, 避免拼接 nil 报错。
+if(APP_NAME == null){ APP_NAME = "test"; }
+if(APP_VERSION == null){ APP_VERSION = "0.0.0"; }
+if(BUILD_TIME == null){ BUILD_TIME = tostring(time()); }
+
+// 宿主 / aac exec 会把剔除自身参数后的列表放进 APP_ARGS;
+// 直接用 IDE 运行时没有这个变量, 退回 _ARGV。
+var argv = _ARGV;
+if(APP_ARGS != null){ argv = APP_ARGS; }
+
+var noPause = false;
+for(i = 1; #argv; 1){
+    if(argv[i] == "--no-pause"){ noPause = true; }
+}
+
+console.log("====================================");
+console.log("  " ++ APP_NAME ++ " v" ++ APP_VERSION);
+console.log("  构建时间: " ++ BUILD_TIME);
+console.log("====================================");
+console.log("");
+
+console.log("[1] 基本输出测试 ...");
+console.log("    Hello from aardio command-line compiler!");
+console.log("    参数个数: " ++ #argv);
+for(i = 1; #argv; 1){
+    console.log("      #" ++ i ++ " = " ++ argv[i]);
+}
+console.log("");
+
+console.log("[2] 数学运算测试 ...");
+var sum = 0;
+for(i = 1; 100; 1){
+    sum = sum + i;
+}
+console.log("    1+2+...+100 = " ++ sum);
+console.log("");
+
+console.log("[3] 模块加载测试 ...");
+var utils, err = loadModule("lib/utils.aardio");
+if(!utils){
+    console.log("    [ERR] 加载模块失败: " ++ tostring(err));
+    if(!noPause){ console.pause(); }
+    return 1;
+}
+utils();
+console.log("");
+
+console.log("[4] 字符串测试 ...");
+var str = "aardio 命令行编译工具";
+console.log("    " ++ str ++ "（长度 " ++ #str ++ "）");
+console.log("");
+
+console.log("所有测试通过!");
+console.log("RESULT:OK");
+
+if(!noPause){
+    console.pause();
+}
+return 0;
