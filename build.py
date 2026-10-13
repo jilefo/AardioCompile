@@ -601,6 +601,42 @@ def _all_processes():
 
 
 # ---------------- 主流程 ----------------
+_DEPLOY_WARNED = False
+
+
+def warn_foreign_deploy_dir(deploy):
+    """自定义部署目录里没有 aardio 标准库时，提前把后果讲清楚
+
+    aac 运行时只从「自己所在目录\\lib」找标准库。用 --deploy-dir 拷到别处后，
+    那个目录十有八九没有 lib\\ —— 表面上宿主能起来、EXE 也照样能发布，
+    但**缺库判定会全线失灵**：真正的自带库被判成"第三方库"，
+    host-add 对致命库 / 重副作用库的拦截也没了依据。
+
+    这个失败模式不报错、只给错的结论（实测把已知致命库 ide 误报成第三方库），
+    所以只能由我们在发布这一步 warn 出来。每轮只提示一次。
+    """
+    global _DEPLOY_WARNED
+    if _DEPLOY_WARNED or not deploy:
+        return
+    _DEPLOY_WARNED = True
+    ae = aacpath.find_aardio_exe()
+    if not ae:
+        return
+    try:
+        same = (os.path.normcase(os.path.abspath(deploy)) ==
+                os.path.normcase(os.path.abspath(str(pathlib.Path(ae).parent))))
+    except Exception:
+        return
+    if same or (pathlib.Path(deploy) / "lib").is_dir():
+        return
+    log("[警告] 部署目录里没有 aardio 标准库: %s\\lib" % deploy)
+    log("       aac 只从「自身所在目录\\lib」找标准库。装到 aardio 安装目录之外时，")
+    log("       缺库判定会给出错误结论（自带库被当成第三方库，A/B/C 分类随之失效，")
+    log("       致命库与重副作用库的拦截也不再可靠），而且全程不报错。")
+    log("       二选一：去掉 --deploy-dir 装到 aardio 安装目录；")
+    log("              或把那个目录下的 lib\\ 复制/联接过来。")
+
+
 def write_local_hint(install_dir):
     """在 aac.exe 的安装目录写一份 aac.local.txt，告诉它源码仓库在哪。
 
@@ -853,6 +889,7 @@ def main():
     if not deploy:
         _ae = aacpath.find_aardio_exe()
         deploy = str(pathlib.Path(_ae).parent) if _ae else ""
+    warn_foreign_deploy_dir(deploy)
 
     for t in targets:
         out = ""
