@@ -1,4 +1,4 @@
 ﻿<?xml version="1.0" encoding="utf-8"?>
-<project ver="10" name="aardioHost" libEmbed="true" output="aardioHost.exe" ui="console" CompanyName="" FileDescription="aac 运行时宿主" LegalCopyright="" ProductName="aardioHost" InternalName="aardioHost" FileVersion="1.0.0.69" ProductVersion="1.0.0.69" publishDir="/dist/" dstrip="false">
+<project ver="10" name="aardioHost" libEmbed="true" output="aardioHost.exe" ui="console" CompanyName="" FileDescription="aac 运行时宿主" LegalCopyright="" ProductName="aardioHost" InternalName="aardioHost" FileVersion="1.0.0.1" ProductVersion="1.0.0.1" publishDir="/dist/" dstrip="false">
 	<file name="main.aardio" path="main.aardio" comment="main.aardio"/>
 </project>

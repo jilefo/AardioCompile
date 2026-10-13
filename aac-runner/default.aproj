@@ -1,4 +1,4 @@
 ﻿<?xml version="1.0" encoding="utf-8"?>
-<project ver="10" name="aac" libEmbed="true" ui="console" output="aac.exe" CompanyName="aac" FileDescription="aardio 命令行编译器" LegalCopyright="" ProductName="aac" InternalName="aac" FileVersion="1.0.0.42" ProductVersion="1.0.0.42" publishDir="/dist/" dstrip="false" local="false" ignored="false">
+<project ver="10" name="aac" libEmbed="true" ui="console" output="aac.exe" CompanyName="aac" FileDescription="aardio 命令行编译器" LegalCopyright="" ProductName="aac" InternalName="aac" FileVersion="1.0.0.1" ProductVersion="1.0.0.1" publishDir="/dist/" dstrip="false" local="false" ignored="false">
 	<file name="main.aardio" path="main.aardio" comment="aardio 命令行编译器"/>
 </project>

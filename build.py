@@ -601,6 +601,32 @@ def _all_processes():
 
 
 # ---------------- 主流程 ----------------
+APROJ_PINNED_VERSION = "1.0.0.1"
+
+
+def normalize_aproj_versions():
+    """把两个 runner 工程里 IDE 自增的版本号按回固定值
+
+    aardio IDE 每次发布都会把 default.aproj 里的 FileVersion / ProductVersion
+    自增。这两个数字对本工程毫无意义 —— 真正的版本是 aac.aardio 里的 AAC_VERSION，
+    发布产物上印的是它被发布那一刻的值，跟仓库里的数字无关。
+
+    但它有个实际危害：每跑一次 build.py all 工作区就变脏一次，
+    贡献者很容易顺手把这种纯噪音提交进来。解决办法是发布前后各归一一次，
+    让跑完构建后 git status 保持干净。
+    """
+    for proj in ("aac-runner", "aardioHost-runner"):
+        f = HERE / proj / "default.aproj"
+        try:
+            txt = f.read_text(encoding="utf-8-sig")
+        except Exception:
+            continue
+        new = re.sub(r'(FileVersion|ProductVersion)="[\d.]+"',
+                     lambda m: '%s="%s"' % (m.group(1), APROJ_PINNED_VERSION), txt)
+        if new != txt:
+            f.write_text(new, encoding="utf-8-sig")
+
+
 _DEPLOY_WARNED = False
 
 
@@ -881,6 +907,8 @@ def main():
 
     if not args.no_sync:
         sync()
+    # 发布前先把 IDE 自增的版本号按回去（理由见 normalize_aproj_versions）
+    normalize_aproj_versions()
 
     rc = 0
     # all 模式的默认落点 = aardio 安装目录（aac 运行时就在那儿找自己依赖的宿主/库）。
@@ -906,6 +934,9 @@ def main():
         r = publish(t, args, out)
         if r and not rc:
             rc = r
+    # 发布完 IDE 又把版本号自增了，这里再按回去，保证 git 工作区不会因为
+    # 一次构建就变脏（见 normalize_aproj_versions）
+    normalize_aproj_versions()
     return rc
 
 
