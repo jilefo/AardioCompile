@@ -671,6 +671,41 @@ def t_relative_hint(c):
     assert "--cwd" in txt, "未给出可行动的修法: %s" % txt[-900:]
 
 
+@case("aproj_version_churn_is_normalized")
+def t_aproj_version_pinned(c):
+    """IDE 自增的 FileVersion/ProductVersion 必须能被按回固定值
+
+    aardio IDE 每次发布都会自增 default.aproj 里的这两个版本号。它们与
+    本工程无关（真正的版本写在 aac.aardio 的 AAC_VERSION 里），但会让
+    每次 build.py all 之后 git 工作区变脏 —— 贡献者很容易顺手把这种纯噪音
+    提交进来。build.py 靠 normalize_aproj_versions() 把它钉住，这里验证
+    它真的会把被改动的文件改回去（而不是只写在注释里）。
+    """
+    import build
+
+    targets = [HERE / proj / "default.aproj"
+               for proj in ("aac-runner", "aardioHost-runner")]
+    for f in targets:
+        raw = f.read_text(encoding="utf-8-sig")
+        f.write_text(raw.replace('FileVersion="%s"' % build.APROJ_PINNED_VERSION,
+                                 'FileVersion="9.9.9.9"')
+                        .replace('ProductVersion="%s"' % build.APROJ_PINNED_VERSION,
+                                 'ProductVersion="9.9.9.9"'),
+                     encoding="utf-8-sig")
+        # 前置校验：这一步没生效的话，后面的"已恢复"就是假绿
+        assert "9.9.9.9" in f.read_text(encoding="utf-8-sig"), "没能篡改版本号: %s" % f
+
+    build.normalize_aproj_versions()
+
+    for f in targets:
+        after = f.read_text(encoding="utf-8-sig")
+        assert "9.9.9.9" not in after, "版本号没被按回去: %s" % f
+        assert 'FileVersion="%s"' % build.APROJ_PINNED_VERSION in after, \
+            "没有恢复到固定值: %s" % f
+        # BOM 不能被弄丢（写回时用 utf-8-sig）
+        assert f.read_bytes().startswith(b"\xef\xbb\xbf"), "BOM 丢了: %s" % f
+
+
 @case("caller_cwd_recovered_and_never_guessed")
 def t_caller_cwd(c):
     """cmd 继承下来的「每驱动器当前目录」要能自动采用，但出现歧义时必须拒绝猜测

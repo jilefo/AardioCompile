@@ -114,7 +114,7 @@ of aardio's source and merely invokes the installed IDE as an external tool.
 ├── lib\aacpkg.aardio        ← 包格式编解码（编译器与宿主共享的唯一源）
 │
 ├── build.py                 ← 同步源码 + 静默发布 + 发布后冒烟（IDE 自动化）
-├── run_tests.py             ← 回归测试（51 个用例）
+├── run_tests.py             ← 回归测试（52 个用例）
 │
 ├── aac-runner\              ← IDE 引导工程①：发布生成 aac.exe
 │   ├── default.aproj
@@ -177,6 +177,10 @@ python build.py all
 
 全过程约 17~33 秒（含两个工程各自的发布后冒烟），不需要手工点 IDE。
 
+> **跑完构建不应弄脏工作区**：aardio IDE 每次发布都会自增 `default.aproj` 里的
+> `FileVersion` / `ProductVersion`。这两个数字与本工程无关，却会让每次构建后
+> `git status` 变脏。`build.py` 在发布前后各归一一次（回归用例
+> `aproj_version_churn_is_normalized` 盯着这件事），所以正常跑完应该是干净的。
 > **发布后必定关 IDE**：`build.py` 用 `try/finally` 包住整个发布流程，
 > 正常、失败、异常三条路径都会把 IDE 关掉。曾经没有这层保护，
 > 异常重试会在后台积累十几个隐藏 IDE 实例，直接拖垮机器。
@@ -1081,7 +1085,7 @@ python run_tests.py -k build             :: 只跑名字含 build 的用例
 python run_tests.py --aac %AARDIO_HOME%\aac.exe
 ```
 
-覆盖 51 个用例（`python run_tests.py` 最后一行会打印总数）：
+覆盖 52 个用例（`python run_tests.py` 最后一行会打印总数）：
 
 | 用例 | 验证点 |
 |------|--------|
@@ -1354,7 +1358,7 @@ main.aardio 直接语法崩掉。
 #### 当时的验收状态（已被 13.4 取代，保留作历史）
 
 ```
-python run_tests.py    →    通过 15 / 失败 0      ← 现在 51 个用例
+python run_tests.py    →    通过 15 / 失败 0      ← 现在 52 个用例
 python build.py all    →    aac.exe 1.67MB + aardioHost.exe 1.67MB，约 17s
                             ← 现在 aac.exe 1.68MB + aardioHost.exe 6.41MB，约 33s（多了发布后冒烟）
 aac build WebexAuto    →    rc=0，1.70MB 独立 EXE
@@ -1800,7 +1804,7 @@ after : 被改写 0 / 新增 0 / 消失 0
 | 脚本 | 一句话 | 什么时候用 |
 |------|--------|-----------|
 | `build.py` | 同步源码 + 静默发布 + 发布后冒烟 | **每次改完 `*.aardio` 都要跑** |
-| `run_tests.py` | 回归测试（51 用例） | 改完自查，交付前必跑 |
+| `run_tests.py` | 回归测试（52 用例） | 改完自查，交付前必跑 |
 | `aac host-add / host-del` | 宿主预埋库增删（幂等） | 报"宿主没预埋 X"时 |
 | `host_grow.py` | 宿主批量扩容，每批真发布 + 真跑 | 要一次性补很多库时 |
 | `lib_probe.py` | 单库体检：import 会不会出事 | 怀疑某个库有毒时 |
@@ -1975,7 +1979,7 @@ python mutation_test.py             :: 给源码植入 7 个已知 bug，audit �
 | 1 | `python audit.py --selftest` | 12 条静态规则（P1–P10）自身的检测器是否还灵 | 规则悄悄失效，后面的静态扫描全变成走过场 |
 | 2 | `python audit.py` | 源码有没踩到 P1–P10（硬编码路径、全盘 wildcard、无 try/finally 等） | 把本机绝对路径写进公开发布的 EXE |
 | 3 | `python mutation_test.py` | 把已知的坏写法塞回去，看审计器能不能报红 | 同上，但证明了那条规则**真的参与过**（详见 13.6 的教训） |
-| 4 | `python run_tests.py` | 50 个功能用例的行为正确性 | 通过了编译但行为不对，直接发布到 `%AARDIO_HOME%\` |
+| 4 | `python run_tests.py` | 52 个功能用例的行为正确性 | 通过了编译但行为不对，直接发布到 `%AARDIO_HOME%\` |
 
 四道全绿之后再 `python build.py all`。顺序不能反。
 
