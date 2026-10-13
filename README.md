@@ -147,7 +147,7 @@ of aardio's source and merely invokes the installed IDE as an external tool.
 ├── depscan_latest.json      ← 最近一次依赖扫描结果
 ├── lib_probe.json           ← 最近一次单库体检结果
 │
-└── aac-readme.md            ← 本文档
+└── README.md                ← 本文档
 ```
 
 > **唯一源原则**：`aac-runner\main.aardio` 和 `aardioHost-runner\main.aardio`
